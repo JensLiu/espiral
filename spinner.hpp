@@ -1,12 +1,12 @@
 #pragma once
 
 #include "includes/espiral_common.h"
+#include "logger.hpp"
 #include "mm/address_space_manager.hpp"
 #include "mm/allocator/vortex_memory_allocator.hpp"
 #include "mm/heap_manager.hpp"
 #include "mm/host_accelerator_interface.hpp"
 #include "mm/scratchpad_memory.hpp"
-#include "logger.hpp"
 
 #include <cassert>
 #include <fstream>
@@ -78,11 +78,13 @@ public:
   }
 
   void start_kernel(kernel_id_t kid) {
+    // mapping
     allocate_vxbin_segments_(kid);
     allocate_user_stack_(kid);
+    allocate_io_pages_(kid);
+    // upload
     upload_vxbin_(kid);
     upload_page_table_(kid);
-
     // debug: print the address mapping
     const auto kcb = kcbs_.at(kid).value();
     const auto mapping = aspace_->dump_address_mapping(kcb.satp);
@@ -171,6 +173,14 @@ public:
   }
 
 private:
+  void allocate_io_pages_(kernel_id_t kid) {
+    const auto kcb = kcbs_.at(kid).value();
+    const auto satp = kcb.satp;
+    const auto io_size = IO_END_ADDR - IO_BASE_ADDR;
+    aspace_->allocate_vm_pages(IO_BASE_ADDR, io_size, satp,
+                               pte_flags::R | pte_flags::W);
+  }
+
   void allocate_vxbin_segments_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
     const auto satp = kcb.satp;
@@ -178,15 +188,36 @@ private:
     const auto max_vma = kcb.kernel_end_va;
     const auto bin_size = kcb.vxbin_size;
 
-    const addr_t code_size_aligned = (bin_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    const addr_t data_va = min_vma + code_size_aligned;
-    const addr_t data_size = (max_vma > data_va) ? max_vma - data_va : 0;
+    // FIXME: different pages for code and data for finer access control
+    //        This is not possible now because of the memory layout of Vortex
+    //        since the .text and .data section are NOT seperated when compiled
+    const addr_t code_end = min_vma + bin_size;
+    const bool has_data = (max_vma > code_end);
+    const addr_t last_code_page = (code_end - 1) & ~(PAGE_SIZE - 1);
+    const bool shared_boundary = has_data && (last_code_page == (code_end & ~(PAGE_SIZE - 1)));
 
-    aspace_->allocate_vm_pages(min_vma, code_size_aligned, satp,
-                               pte_flags::R | pte_flags::X);
-    if (data_size > 0) {
-      aspace_->allocate_vm_pages(data_va, data_size, satp,
-                                 pte_flags::R | pte_flags::W);
+    if (shared_boundary) {
+      if (last_code_page > min_vma) {
+        aspace_->allocate_vm_pages(min_vma, last_code_page - min_vma, satp,
+                                   pte_flags::R | pte_flags::W | pte_flags::X);
+      }
+      aspace_->allocate_one_vm_page(last_code_page, satp,
+                                    pte_flags::R | pte_flags::W | pte_flags::X);
+      const addr_t next_page = last_code_page + PAGE_SIZE;
+      if (max_vma > next_page) {
+        aspace_->allocate_vm_pages(next_page, max_vma - next_page, satp,
+                                   pte_flags::R | pte_flags::W);
+      }
+    } else {
+      // no code-data shared boundary
+      const addr_t code_size_aligned = (bin_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+      aspace_->allocate_vm_pages(min_vma, code_size_aligned, satp,
+                                 pte_flags::R | pte_flags::X);
+      const addr_t data_va = min_vma + code_size_aligned;
+      if (has_data && max_vma > data_va) {
+        aspace_->allocate_vm_pages(data_va, max_vma - data_va, satp,
+                                   pte_flags::R | pte_flags::W);
+      }
     }
   }
 
