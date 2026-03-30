@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../mm/host_accelerator_interface.hpp"
+#include "../mm/address_space_manager.hpp"
 #include "vortex.h"
 
 #include <chrono>
@@ -67,8 +68,10 @@ public:
     this->dcr_write(VX_DCR_BASE_STARTUP_ADDR1, krnl_addr >> 32);
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG0, args_addr & 0xffffffff);
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG1, args_addr >> 32);
-    this->dcr_write(VX_DCR_BASE_STARTUP_SATP0, satp & 0xffffffff);
-    this->dcr_write(VX_DCR_BASE_STARTUP_SATP1, satp >> 32);
+    // SATP must be configured via set_satp_by_addr, not via DCR write:
+    // processor_.dcr_write() only stores to a map; it does not propagate to cores.
+    // Extract PT physical base from SV32 satp: bits [21:0] are PPN.
+    processor_.set_satp_by_addr(AddressSpaceManager::from_satp(satp));
 
     // start new run
     future_ = std::async(std::launch::async, [&] { processor_.run(); });

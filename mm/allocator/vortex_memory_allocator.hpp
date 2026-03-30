@@ -14,43 +14,69 @@
 // Memory Allocator from Vortex
 #pragma once
 
-#include <cstdint>
+#include "../../includes/common.h"
+#include "memory_allocator_interface.hpp"
+
 #include <assert.h>
-#include <stdio.h>
+#include <cstdint>
 #include <mutex>
 #include <optional>
+#include <stdio.h>
+#include <stdexcept>
 
 namespace espiral {
 
-class MemoryAllocator {
+class VortexMemoryAllocator : public MemoryAllocatorInterface {
 public:
-  MemoryAllocator(
-    uint64_t baseAddress,
-    uint64_t capacity,
-    uint32_t pageAlign,
-    uint32_t blockAlign)
-    : baseAddress_(baseAddress)
-    , capacity_(capacity)
-    , pageAlign_(pageAlign)
-    , blockAlign_(blockAlign)
-    , pages_(nullptr)
-    , allocated_(0)
-  {}
+  VortexMemoryAllocator()
+      : baseAddress_(0), capacity_(0), pageAlign_(0), blockAlign_(0), pages_(nullptr), allocated_(0) {}
 
-  ~MemoryAllocator() {
+  void init_base_address(uint64_t base) override {
+    baseAddress_ = base;
+  }
+
+  void init_capacity(uint64_t capacity) override {
+    capacity_ = capacity;
+  }
+
+  void init_page_alignment(uint32_t align) override {
+    pageAlign_ = align;
+  }
+
+  void init_block_alignment(uint32_t align) override {
+    blockAlign_ = align;
+  }
+
+  auto get_base_address() const -> addr_t override {
+    return baseAddress_;
+  }
+
+  auto get_capacity() const -> uint64_t override {
+    return capacity_;
+  }
+
+  void grow_capacity(uint64_t additional_capacity) override {
+    throw std::runtime_error("VortexMemoryAllocator does not support grow_capacity");
+  }
+
+  bool shrink_capacity(uint64_t reduced_capacity) override {
+    throw std::runtime_error("VortexMemoryAllocator does not support shrink_capacity");
+  }
+
+  ~VortexMemoryAllocator() {
     // Free allocated pages
-    page_t* currPage = pages_;
+    page_t *currPage = pages_;
     while (currPage) {
       auto nextPage = currPage->next;
-      #ifdef false
-      block_t* currblock = currPage->findfirstUsedBlock();
-      block_t* nextblock;
+#ifdef false
+      block_t *currblock = currPage->findfirstUsedBlock();
+      block_t *nextblock;
       while (currblock) {
-        nextblock= currblock->nextUsed;
+        nextblock = currblock->nextUsed;
         currPage->release(currblock);
         currblock = nextblock;
       }
-      #endif
+#endif
       delete currPage;
       currPage = nextPage;
     }
@@ -72,11 +98,11 @@ public:
     return allocated_;
   }
 
-  void begin_transaction() {
+  void begin_transaction() override {
     mutex_.lock();
   }
-  
-  void end_transaction() {
+
+  void end_transaction() override {
     mutex_.unlock();
   }
 
@@ -91,14 +117,14 @@ public:
 
     // Check if the reservation is within memory capacity bounds
     if (addr + size > baseAddress_ + capacity_) {
-      printf("Error: address range out of bounds - requested=0x%lx, base+capacity=0x%lx\n", (addr + size), (baseAddress_ +capacity_));
+      printf("Error: address range out of bounds - requested=0x%lx, base+capacity=0x%lx\n", (addr + size), (baseAddress_ + capacity_));
       return -1;
     }
 
     // Ensure the reservation does not overlap with existing pages
     uint64_t overlapStart, overlapEnd;
     if (hasPageOverlap(addr, size, &overlapStart, &overlapEnd)) {
-      printf("Error: address range overlaps with existing allocation - requested=[0x%lx-0x%lx], existing=[0x%lx, 0x%lx]\n", addr, addr+size, overlapStart, overlapEnd);
+      printf("Error: address range overlaps with existing allocation - requested=[0x%lx-0x%lx], existing=[0x%lx, 0x%lx]\n", addr, addr + size, overlapStart, overlapEnd);
       return -1;
     }
 
@@ -120,12 +146,7 @@ public:
     return reserve(addr, size);
   }
 
-  auto allocate_atomic(uint64_t size) -> std::optional<uint32_t> {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return allocate(size);
-  }
-
-  auto allocate(uint64_t size) -> std::optional<uint32_t> {
+  auto allocate(size_t size) -> std::optional<addr_t> override {
     if (size == 0) {
       printf("Error: invalid arguments\n");
       return std::nullopt;
@@ -135,7 +156,7 @@ public:
     size = alignSize(size, blockAlign_);
 
     // Walk thru all pages to find a free block
-    block_t* freeBlock = nullptr;
+    block_t *freeBlock = nullptr;
     auto currPage = pages_;
     while (currPage) {
       freeBlock = currPage->findFreeBlock(size);
@@ -166,17 +187,12 @@ public:
     // Update allocated size
     allocated_ += size;
 
-    return std::optional<uint32_t>(freeBlock->addr);
+    return std::optional<addr_t>(freeBlock->addr);
   }
 
-  auto release_atomic(uint64_t addr) -> bool {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return release(addr);
-  }
-
-  auto release(uint64_t addr) -> bool {
+  auto release(addr_t addr) -> bool override {
     // Walk all pages to find the pointer
-    block_t* usedBlock = nullptr;
+    block_t *usedBlock = nullptr;
     auto currPage = pages_;
     while (currPage) {
       usedBlock = currPage->findUsedBlock(addr);
@@ -187,7 +203,7 @@ public:
 
     // found the corresponding block?
     if (nullptr == usedBlock) {
-      printf("warning: release address not found: 0x%lx\n", addr);
+      printf("warning: release address not found: 0x%lx\n", static_cast<size_t>(addr));
       return false;
     }
 
@@ -208,52 +224,40 @@ public:
   }
 
 private:
-
   struct block_t {
-    block_t* nextFreeS;
-    block_t* prevFreeS;
+    block_t *nextFreeS;
+    block_t *prevFreeS;
 
-    block_t* nextFreeM;
-    block_t* prevFreeM;
+    block_t *nextFreeM;
+    block_t *prevFreeM;
 
-    block_t* nextUsed;
-    block_t* prevUsed;
+    block_t *nextUsed;
+    block_t *prevUsed;
 
     uint64_t addr;
     uint64_t size;
 
     block_t(uint64_t addr, uint64_t size)
-      : nextFreeS(nullptr)
-      , prevFreeS(nullptr)
-      , nextFreeM(nullptr)
-      , prevFreeM(nullptr)
-      , nextUsed(nullptr)
-      , prevUsed(nullptr)
-      , addr(addr)
-      , size(size)
-    {}
+        : nextFreeS(nullptr), prevFreeS(nullptr), nextFreeM(nullptr), prevFreeM(nullptr), nextUsed(nullptr), prevUsed(nullptr), addr(addr), size(size) {}
   };
 
   struct page_t {
-    page_t*  next;
+    page_t *next;
     uint64_t addr;
     uint64_t size;
 
-    page_t(uint64_t addr, uint64_t size, uint32_t blockAlign) :
-      next(nullptr),
-      addr(addr),
-      size(size),
-      blockAlign_(blockAlign),
-      usedList_(nullptr) {
+    page_t(uint64_t addr, uint64_t size, uint32_t blockAlign) : next(nullptr),
+                                                                addr(addr),
+                                                                size(size),
+                                                                blockAlign_(blockAlign),
+                                                                usedList_(nullptr) {
       freeSList_ = freeMList_ = new block_t(addr, size);
     }
 
     ~page_t() {
       // The page should be empty
       assert(nullptr == usedList_);
-      assert(freeMList_
-          && (nullptr == freeMList_->nextFreeM)
-          && (nullptr == freeMList_->prevFreeM));
+      assert(freeMList_ && (nullptr == freeMList_->nextFreeM) && (nullptr == freeMList_->prevFreeM));
       delete freeMList_;
     }
 
@@ -261,7 +265,7 @@ private:
       return (usedList_ == nullptr);
     }
 
-    void allocate(uint64_t size, block_t* freeBlock) {
+    void allocate(uint64_t size, block_t *freeBlock) {
       // Remove the block from the free lists
       this->removeFreeMList(freeBlock);
       this->removeFreeSList(freeBlock);
@@ -286,7 +290,7 @@ private:
       this->insertUsedList(freeBlock);
     }
 
-    void release(block_t* usedBlock) {
+    void release(block_t *usedBlock) {
       // Remove the block from the used list
       this->removeUsedList(usedBlock);
 
@@ -340,7 +344,7 @@ private:
       this->insertFreeSList(usedBlock);
     }
 
-    block_t* findFreeBlock(uint64_t size) {
+    block_t *findFreeBlock(uint64_t size) {
       auto freeBlock = freeSList_;
       if (freeBlock) {
         // The free S-list is already sorted with the largest block first
@@ -357,7 +361,7 @@ private:
       return nullptr;
     }
 
-    block_t* findUsedBlock(uint64_t addr) {
+    block_t *findUsedBlock(uint64_t addr) {
       if (addr >= this->addr && addr < (this->addr + this->size)) {
         auto useBlock = usedList_;
         while (useBlock) {
@@ -369,14 +373,13 @@ private:
       return nullptr;
     }
 #ifdef false
-    block_t* findfirstUsedBlock() {
+    block_t *findfirstUsedBlock() {
       return usedList_;
     }
 #endif
 
   private:
-
-    void insertUsedList(block_t* block) {
+    void insertUsedList(block_t *block) {
       block->nextUsed = usedList_;
       if (usedList_) {
         usedList_->prevUsed = block;
@@ -384,7 +387,7 @@ private:
       usedList_ = block;
     }
 
-    void removeUsedList(block_t* block) {
+    void removeUsedList(block_t *block) {
       if (block->prevUsed) {
         block->prevUsed->nextUsed = block->nextUsed;
       } else {
@@ -397,9 +400,9 @@ private:
       block->prevUsed = nullptr;
     }
 
-    void insertFreeMList(block_t* block) {
-      block_t* currBlock = freeMList_;
-      block_t* prevBlock = nullptr;
+    void insertFreeMList(block_t *block) {
+      block_t *currBlock = freeMList_;
+      block_t *prevBlock = nullptr;
       while (currBlock && (currBlock->addr < block->addr)) {
         prevBlock = currBlock;
         currBlock = currBlock->nextFreeM;
@@ -416,7 +419,7 @@ private:
       }
     }
 
-    void removeFreeMList(block_t* block) {
+    void removeFreeMList(block_t *block) {
       if (block->prevFreeM) {
         block->prevFreeM->nextFreeM = block->nextFreeM;
       } else {
@@ -429,9 +432,9 @@ private:
       block->prevFreeM = nullptr;
     }
 
-    void insertFreeSList(block_t* block) {
-      block_t* currBlock = freeSList_;
-      block_t* prevBlock = nullptr;
+    void insertFreeSList(block_t *block) {
+      block_t *currBlock = freeSList_;
+      block_t *prevBlock = nullptr;
       while (currBlock && (currBlock->size > block->size)) {
         prevBlock = currBlock;
         currBlock = currBlock->nextFreeS;
@@ -448,7 +451,7 @@ private:
       }
     }
 
-    void removeFreeSList(block_t* block) {
+    void removeFreeSList(block_t *block) {
       if (block->prevFreeS) {
         block->prevFreeS->nextFreeS = block->nextFreeS;
       } else {
@@ -465,18 +468,18 @@ private:
     uint32_t blockAlign_;
 
     // List of used blocks
-    block_t* usedList_;
+    block_t *usedList_;
 
     // List with blocks sorted by decreasing sizes
     // Used for block lookup during memory allocation.
-    block_t* freeSList_;
+    block_t *freeSList_;
 
     // List with blocks sorted by increasing memory addresses
     // Used for block merging during memory release.
-    block_t* freeMList_;
+    block_t *freeMList_;
   };
 
-  page_t* createPage(uint64_t addr, uint64_t size) {
+  page_t *createPage(uint64_t addr, uint64_t size) {
     // Allocate object
     auto newPage = new page_t(addr, size, blockAlign_);
 
@@ -485,7 +488,7 @@ private:
       newPage->next = pages_;
       pages_ = newPage;
     } else {
-      page_t* current = pages_;
+      page_t *current = pages_;
       while (current->next != nullptr && current->next->addr < newPage->addr) {
         current = current->next;
       }
@@ -496,9 +499,9 @@ private:
     return newPage;
   }
 
-  void deletePage(page_t* page) {
+  void deletePage(page_t *page) {
     // Remove the page from the list
-    page_t* prevPage = nullptr;
+    page_t *prevPage = nullptr;
     auto currPage = pages_;
     while (currPage) {
       if (currPage == page) {
@@ -516,13 +519,13 @@ private:
     delete page;
   }
 
-  bool findNextAddress(uint64_t size, uint64_t* addr) {
+  bool findNextAddress(uint64_t size, uint64_t *addr) {
     if (pages_ == nullptr) {
       *addr = baseAddress_;
       return true;
     }
 
-    page_t* current = pages_;
+    page_t *current = pages_;
     uint64_t endOfLastPage = baseAddress_;
 
     while (current != nullptr) {
@@ -547,8 +550,8 @@ private:
     return false;
   }
 
-  bool hasPageOverlap(uint64_t start, uint64_t size, uint64_t* overlapStart, uint64_t* overlapEnd) {
-    page_t* current = pages_;
+  bool hasPageOverlap(uint64_t start, uint64_t size, uint64_t *overlapStart, uint64_t *overlapEnd) {
+    page_t *current = pages_;
     while (current != nullptr) {
       uint64_t pageStart = current->addr;
       uint64_t pageEnd = pageStart + current->size;
@@ -572,10 +575,10 @@ private:
   uint64_t capacity_;
   uint32_t pageAlign_;
   uint32_t blockAlign_;
-  page_t*  pages_;
+  page_t *pages_;
   uint64_t nextAddress_;
   uint64_t allocated_;
   std::mutex mutex_;
 };
 
-} // namespace vortex
+} // namespace espiral

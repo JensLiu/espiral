@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../includes/common.h"
-#include "memory_allocator.hpp"
+#include "allocator/memory_allocator_interface.hpp"
 #include "scratchpad_memory.hpp"
 #include <optional>
 #include <stdexcept>
@@ -13,11 +13,23 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+// The Address Space Manager maintains the page tables for all kernels
+// It provides page-grained virtual memory management
 class AddressSpaceManager {
 public:
-  AddressSpaceManager(MemoryAllocator *pageAllocator,
+  AddressSpaceManager(MemoryAllocatorInterface *pageAllocator,
                       ScratchpadMemory *scratchpadMemory)
-      : page_allocator_(pageAllocator), scratchpad_(scratchpadMemory) {}
+      : page_allocator_(pageAllocator), scratchpad_(scratchpadMemory) {
+    page_allocator_->init_base_address(GLOBAL_MEM_BASE_ADDR);
+    page_allocator_->init_capacity(GLOBAL_MEM_SIZE);
+    page_allocator_->init_page_alignment(PAGE_SIZE);
+    page_allocator_->init_block_alignment(PAGE_SIZE);
+  }
+
+  ~AddressSpaceManager() {
+    delete page_allocator_;
+    delete scratchpad_;
+  }
 
   auto allocate_page_table() -> std::optional<satp_t> {
     if (auto pgtbl_pa = allocate_page_table_node()) {
@@ -32,13 +44,13 @@ public:
     map_addr_inner(va, pa, from_satp(satp), flags);
   }
 
-  auto translate_or_else_allocate(uint32_t va, satp_t satp) -> int32_t {
-    const auto pa = translate(va, satp).value_or(0);
-    if (pa == 0) {
-      allocate_one_vm(va, satp);
+  auto translate_or_else_allocate_page(uint32_t va, satp_t satp) -> int32_t {
+    const auto pa = translate(va, satp);
+    if (!pa.has_value()) {
+      allocate_one_vm_page(va, satp);
       return translate(va, satp).value();
     }
-    return pa;
+    return *pa;
   }
 
   auto translate(uint32_t va, satp_t satp) -> std::optional<uint32_t> {
@@ -53,15 +65,16 @@ public:
     free_page_table_inner(from_satp(satp), PT_LEVELS - 1);
   }
 
-  void allocate_vm(uint32_t va, uint32_t size, satp_t satp,
-                   uint32_t flags = pte_flags::R | pte_flags::W) {
+  void allocate_vm_pages(uint32_t va, uint32_t size, satp_t satp,
+                         uint32_t flags = pte_flags::R | pte_flags::W) {
     for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE) {
-      allocate_one_vm(va + offset, satp, flags);
+      allocate_one_vm_page(va + offset, satp, flags);
     }
   }
 
-  void allocate_one_vm(uint32_t va, satp_t satp, uint32_t flags = pte_flags::R | pte_flags::W) {
-    auto pa = page_allocator_->allocate_atomic(PAGE_SIZE).value_or(0);
+  void allocate_one_vm_page(uint32_t va, satp_t satp, uint32_t flags = pte_flags::R | pte_flags::W) {
+
+    auto pa = page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
     if (pa == 0) {
       throw std::runtime_error("Failed to allocate physical page for VM");
     }
@@ -164,7 +177,7 @@ private:
 
   auto allocate_page_table_node() -> std::optional<uint32_t> {
     const uint64_t addr_64 =
-        page_allocator_->allocate_atomic(PAGE_SIZE).value_or(0);
+        page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
     if (addr_64 != 0) {
       return static_cast<uint32_t>(addr_64);
     }
@@ -178,11 +191,16 @@ private:
     auto page_data = scratchpad_->read_atomic(pa, PAGE_SIZE);
     for (size_t i = 0; i < PAGE_SIZE; i += PTE_SIZE) {
       uint32_t pte = *reinterpret_cast<const uint32_t *>(&page_data[i]);
-      if (pte_valid(pte) && !pte_is_leaf(pte) && level > 0) {
-        free_page_table_inner(pte_pa(pte), level - 1);
+      if (pte_valid(pte)) {
+        if (!pte_is_leaf(pte)) {
+          free_page_table_inner(pte_pa(pte), level - 1);
+        } else {
+          page_allocator_->atomic_release(pte_pa(pte));
+        }
       }
     }
-    page_allocator_->release_atomic(pa);
+
+    page_allocator_->atomic_release(pa);
   }
 
   void dump_page_table_inner(uint32_t root_pa, sparse_scratchpad_t &dump) {
@@ -195,12 +213,18 @@ private:
       }
     }
   }
-  
+
   // SV32 configuration
+public:
+  // SV32 satp: bit[31]=1 (SV32 mode), bits[30:22]=ASID=0, bits[21:0]=PPN
+  static auto make_satp(addr_t pgtbl_pa) -> satp_t {
+    return (1u << 31) | ((pgtbl_pa >> 12) & 0x3FFFFFu);
+  }
+  static auto from_satp(satp_t satp) -> addr_t {
+    return (satp & 0x3FFFFFu) << 12;
+  }
 
-  static auto make_satp(uint32_t pgtbl_pa) -> satp_t { return pgtbl_pa; }
-  static auto from_satp(satp_t satp) -> uint32_t { return satp; }
-
+private:
   // SV32 PTE layout: PPN[31:10], flags[9:0]
   static auto make_pte(uint32_t pa, uint32_t flags) -> uint32_t {
     return ((pa >> 12) << 10) | (flags & 0x3FF);
@@ -222,7 +246,7 @@ private:
   }
   static auto va_pgoff(uint32_t va) -> uint32_t { return va & 0xFFF; }
 
-  MemoryAllocator *page_allocator_;
+  MemoryAllocatorInterface *page_allocator_;
   ScratchpadMemory *scratchpad_;
 };
 } // namespace espiral

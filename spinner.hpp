@@ -2,8 +2,9 @@
 
 #include "includes/common.h"
 #include "mm/address_space_manager.hpp"
+#include "mm/allocator/vortex_memory_allocator.hpp"
+#include "mm/heap_manager.hpp"
 #include "mm/host_accelerator_interface.hpp"
-#include "mm/memory_allocator.hpp"
 #include "mm/scratchpad_memory.hpp"
 
 #include <cassert>
@@ -11,29 +12,74 @@
 #include <string>
 
 namespace espiral {
+class UploadBuffer {
+  friend class Spinner;
 
-template <typename AcceleratorType> class Spinner {
+private:
+  const uint32_t va;
+  const uint32_t device_max_size;
+  const uint32_t flags;
+  const void *host_ptr;
+  size_t size;
+  // created by the Spinner
+  UploadBuffer(uint32_t va, uint32_t max_size, uint32_t flags = pte_flags::R | pte_flags::W)
+      : va(va), device_max_size(max_size), flags(flags), host_ptr(nullptr), size(0) {}
+
 public:
-  Spinner(uint64_t baseAddress, uint64_t capacity, uint32_t pageAlign,
-          uint32_t blockAlign) {
-    page_allocator_ =
-        new MemoryAllocator(baseAddress, capacity, pageAlign, blockAlign);
-    scratchpad_ = new ScratchpadMemory();
-    aspace_ = new AddressSpaceManager(page_allocator_, scratchpad_);
-    accelerator_ = new AcceleratorType();
+  void set_content(const void *data, size_t data_size) {
+    if (data_size > device_max_size) {
+      throw std::runtime_error("Data size exceeds buffer capacity");
+    }
+    host_ptr = data;
+    size = data_size;
+  }
+};
+
+class DownloadBuffer {
+  friend class Spinner;
+
+private:
+  const uint32_t va;
+  const uint32_t read_size;
+  void *host_ptr;
+
+public:
+  DownloadBuffer(uint32_t va, uint32_t read_size, void *host_ptr)
+      : va(va), read_size(read_size), host_ptr(host_ptr) {}
+};
+
+class Spinner {
+  struct KernelControlBlock {
+    addr_t satp;
+    std::string vxbin_path;
+    size_t vxbin_size;
+    addr_t args_va;
+    addr_t start_pc_va;
+    // memory layout
+    addr_t kernel_end_va;
+    addr_t kernel_start_va;
+    // heap virtual memory management
+    HeapManager *heap;
+  };
+
+public:
+  Spinner(HostAcceleratorInterface *accelerator) : accelerator_(accelerator) {
+    // address space manager
+    aspace_ = new AddressSpaceManager(new VortexMemoryAllocator(), new ScratchpadMemory());
   }
 
   ~Spinner() {
     // TODO: safety checks
     delete aspace_;
-    delete scratchpad_;
-    delete page_allocator_;
     delete accelerator_;
   }
 
   void start_kernel(kernel_id_t kid) {
-    const auto kcb = kcbs_.at(kid).value();
-    accelerator_->start(kcb.start_va, kcb.args_va, kcb.satp);
+    allocate_vxbin_segments_(kid);
+    allocate_user_stack_(kid);
+    upload_vxbin_(kid);
+    upload_page_table_(kid);
+    start_kernel_(kid);
   }
 
   void wait_kernel(kernel_id_t kid, uint64_t timeout) {
@@ -43,20 +89,22 @@ public:
 
   void free_kernel(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
+    delete kcb.heap;
     aspace_->free_page_table(kcb.satp);
-    free_kcb(kid);
+    free_kcb_(kid);
   }
 
   auto allocate_kernel(std::string vxbin_path) -> kernel_id_t {
-    const kernel_id_t kid = allocate_kcb();
-    const satp_t satp = aspace_->allocate_page_table().value_or(0);
-    if (satp == 0) {
-      free_kcb(kid);
+    const kernel_id_t kid = allocate_kcb_();
+    const auto satp_opt = aspace_->allocate_page_table();
+    if (!satp_opt.has_value()) {
+      free_kcb_(kid);
       throw std::runtime_error("Failed to allocate page table for kernel");
     }
+    const satp_t satp = *satp_opt;
 
     // parse vxbin and load segments to memory
-    const auto vxbin_content = read_vxbin(vxbin_path);
+    const auto vxbin_content = read_vxbin_(vxbin_path);
     const auto *bytes =
         reinterpret_cast<const uint64_t *>(vxbin_content.data());
     const auto min_vma = *bytes++;
@@ -64,92 +112,107 @@ public:
     const auto bin_size = vxbin_content.size() - 2 * 8;
     const auto runtime_size = (max_vma - min_vma);
 
-    // memory allocation (reservation)
-    // code segment
-    aspace_->allocate_vm(min_vma, bin_size, satp, pte_flags::R);
-    // global variable segment
-    aspace_->allocate_vm(min_vma + bin_size, runtime_size - bin_size, satp,
-                         pte_flags::R | pte_flags::W);
-
     KernelControlBlock kcb{
         .satp = satp,
-        .start_va = 0x80000000,                    // < fixed
-        .min_vma = static_cast<uint32_t>(min_vma), // < start of the kernel
-        .max_vma = static_cast<uint32_t>(max_vma), // < end of the kernel
         .vxbin_path = vxbin_path,
+        .vxbin_size = bin_size,
         .args_va = 0,
+        .start_pc_va = 0x80000000,
+        .kernel_end_va = static_cast<addr_t>(max_vma),
+        .kernel_start_va = static_cast<addr_t>(min_vma),
+        .heap = new HeapManager(aspace_, satp, max_vma),
     };
 
     kcbs_.at(kid) = kcb;
-
-    upload_vxbin(kid);
-
     return kid;
   }
 
-  void upload_bytes(kernel_id_t kid, const uint32_t base_va,
-                    const void *content, size_t size) {
+  // Allocate a data buffer in the kernel's virtual address space.
+  // Returns the VA. Must be called before upload_page_table().
+  auto allocate_upload_buffer(kernel_id_t kid, size_t size,
+                              uint32_t flags = pte_flags::R | pte_flags::W) -> UploadBuffer {
     const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
-    for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
-      const auto chunk_size =
-          std::min(static_cast<size_t>(PAGE_SIZE), size - offset);
-      const auto va = base_va + offset;
-      const auto pa = aspace_->translate_or_else_allocate(va, satp);
-      accelerator_->upload(pa, (uint8_t *)content + offset, chunk_size);
-    }
+    auto *heap_mngr = kcb.heap;
+    const addr_t va = heap_mngr->allocate(size).value();
+    // const uint32_t safe_flags = flags & (pte_flags::R | pte_flags::W);
+    return UploadBuffer(va, size, pte_flags::R | pte_flags::W);
   }
 
-  template <typename T> void upload_args(kernel_id_t kid, const T *args) {
+  void upload(kernel_id_t kid, const UploadBuffer &buffer) {
+    const auto kcb = kcbs_.at(kid).value();
+    copy_host_to_dev_(kid, buffer.va, buffer.host_ptr, buffer.size);
+  }
+
+  void download(kernel_id_t kid, const DownloadBuffer &buffer) {
+    copy_dev_to_host_(kid, buffer.va, buffer.host_ptr, buffer.read_size);
+  }
+
+  template <typename T>
+  void upload_args(kernel_id_t kid, const T *args) {
     auto &kcb = kcbs_.at(kid).value();
-    kcb.args_va = kcb.max_vma; // < place args at the end of the address space
-    upload_bytes(kid, kcb.args_va, args, sizeof(T));
-  }
-
-  void upload_page_table(kernel_id_t kid) {
-    const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
-    const auto pt_content = aspace_->dump_page_table(satp);
-    upload_sparse_scratchpad(kid, pt_content);
-  }
-
-  void download(kernel_id_t kid, uint32_t va, void *dest, size_t size) {
-    const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
-    for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
-      const auto chunk_size =
-          std::min(static_cast<size_t>(PAGE_SIZE), size - offset);
-      const auto current_va = va + offset;
-      const auto pa = aspace_->translate(current_va, satp).value_or(0);
-      if (pa == 0) {
-        throw std::runtime_error("Invalid virtual address");
-      }
-      accelerator_->download((uint8_t *)dest + offset, pa, chunk_size);
-    }
+    auto *heap_mngr = kcb.heap;
+    kcb.args_va = heap_mngr->allocate(sizeof(T)).value();
+    copy_host_to_dev_(kid, kcb.args_va, args, sizeof(T));
   }
 
 private:
-  void upload_vxbin(kernel_id_t kid) {
+  void allocate_vxbin_segments_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
-    const auto vxbin_content = read_vxbin(kcb.vxbin_path);
+    const auto satp = kcb.satp;
+    const auto min_vma = kcb.kernel_start_va;
+    const auto max_vma = kcb.kernel_end_va;
+    const auto bin_size = kcb.vxbin_size;
+    const auto runtime_size = (max_vma - min_vma);
+
+    // allocate virtual memory for the whole binary, including .text, .data and .bss
+    // the actual content will be uploaded later by upload_vxbin_()
+    // memory allocation (reservation)
+    // code segment
+    aspace_->allocate_vm_pages(min_vma, bin_size, satp, pte_flags::R | pte_flags::X);
+    // global variable segment
+    aspace_->allocate_vm_pages(min_vma + bin_size, runtime_size - bin_size, satp,
+                               pte_flags::R | pte_flags::W);
+  }
+
+  void allocate_user_stack_(kernel_id_t kid) {
+    const auto kcb = kcbs_.at(kid).value();
+    const size_t per_stack_size = 1 << STACK_LOG2_SIZE;
+    // reserve maximum possible stack space
+    const uint32_t stack_size = per_stack_size * NUM_THREADS * NUM_WARPS * NUM_CORES * NUM_CLUSTERS;
+    const uint32_t stack_top_va = STACK_BASE_ADDR;
+    const uint32_t stack_base_va = stack_top_va - stack_size;
+    aspace_->allocate_vm_pages(stack_base_va, stack_size, kcb.satp,
+                               pte_flags::R | pte_flags::W);
+  }
+
+  void upload_page_table_(kernel_id_t kid) {
+    const auto kcb = kcbs_.at(kid).value();
+    const auto satp = kcb.satp;
+    const auto pt_content = aspace_->dump_page_table(satp);
+    upload_sparse_scratchpad_(kid, pt_content);
+  }
+
+  void upload_vxbin_(kernel_id_t kid) {
+    const auto kcb = kcbs_.at(kid).value();
+    const auto vxbin_content = read_vxbin_(kcb.vxbin_path);
     const auto *bytes =
         reinterpret_cast<const uint64_t *>(vxbin_content.data());
     const auto min_vma = *bytes++;
     const auto max_vma = *bytes++;
-    assert(min_vma == kcb.min_vma);
-    assert(max_vma == kcb.max_vma);
-    upload_bytes(kid, min_vma, bytes, vxbin_content.size() - 2 * 8);
+    assert(min_vma == kcb.kernel_start_va);
+    assert(max_vma == kcb.kernel_end_va);
+    copy_host_to_dev_(kid, min_vma, bytes, vxbin_content.size() - 2 * 8);
   }
 
-  void upload_sparse_scratchpad(kernel_id_t kid,
-                                const sparse_scratchpad_t &data) {
+  void upload_sparse_scratchpad_(kernel_id_t kid,
+                                 const sparse_scratchpad_t &data) {
     const auto kcb = kcbs_.at(kid).value();
     for (const auto &[pa, content] : data) {
       accelerator_->upload(pa, content.data(), content.size());
     }
   }
 
-  auto read_vxbin(const std::string &vxbin_path) -> std::vector<char> {
+  auto read_vxbin_(const std::string &vxbin_path) -> std::vector<char> {
     std::ifstream ifs(vxbin_path, std::ios::binary);
     if (!ifs) {
       throw std::runtime_error("Error: " + vxbin_path + " not found");
@@ -164,16 +227,7 @@ private:
     return std::move(content);
   }
 
-  struct KernelControlBlock {
-    uint32_t satp;
-    uint32_t start_va;
-    uint32_t min_vma;
-    uint32_t max_vma;
-    std::string vxbin_path;
-    uint32_t args_va;
-  };
-
-  auto allocate_kcb() -> kernel_id_t {
+  auto allocate_kcb_() -> kernel_id_t {
     std::lock_guard<std::mutex> lock(kcb_mutex_);
     for (size_t i = 0; i < kcbs_.size(); ++i) {
       if (!kcbs_.at(i).has_value()) {
@@ -184,17 +238,52 @@ private:
     return kcbs_.size() - 1;
   }
 
-  void free_kcb(kernel_id_t kid) {
+  void free_kcb_(kernel_id_t kid) {
     std::lock_guard<std::mutex> lock(kcb_mutex_);
     kcbs_.at(kid).reset();
+  }
+
+  void copy_dev_to_host_(kernel_id_t kid, uint32_t va, void *dest, size_t size) {
+    const auto kcb = kcbs_.at(kid).value();
+    const auto satp = kcb.satp;
+    va = page_align_down(va);
+    for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
+      const auto chunk_size =
+          std::min(static_cast<size_t>(PAGE_SIZE), size - offset);
+      const auto current_va = va + offset;
+      const auto pa = aspace_->translate(current_va, satp).value();
+      accelerator_->download((uint8_t *)dest + offset, pa, chunk_size);
+    }
+  }
+
+  void copy_host_to_dev_(kernel_id_t kid, const uint32_t base_va,
+                         const void *content, size_t size) {
+    const auto kcb = kcbs_.at(kid).value();
+    const auto satp = kcb.satp;
+    for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
+      const auto chunk_size =
+          std::min(static_cast<size_t>(PAGE_SIZE), size - offset);
+      const auto va = base_va + offset;
+      const auto pa = aspace_->translate(va, satp).value(); // assume success
+      accelerator_->upload(pa, (uint8_t *)content + offset, chunk_size);
+    }
+  }
+
+  auto page_align_down(uint32_t addr) -> uint32_t {
+    return addr & ~(PAGE_SIZE - 1);
+  }
+
+  void start_kernel_(kernel_id_t kid) {
+    const auto kcb = kcbs_.at(kid).value();
+    accelerator_->start(kcb.start_pc_va, kcb.args_va, kcb.satp);
   }
 
   std::mutex kcb_mutex_;
   // TODO: protect each KCB with a mutex
   std::vector<std::optional<KernelControlBlock>> kcbs_;
-  MemoryAllocator *page_allocator_;
+  // Manages virtual page to physical page mappings
   AddressSpaceManager *aspace_;
-  ScratchpadMemory *scratchpad_; // < used only for page table storage (for now)
+  // Talks to the Accelerator
   HostAcceleratorInterface *accelerator_;
 };
 
