@@ -293,26 +293,29 @@ private:
   void copy_dev_to_host_(kernel_id_t kid, uint32_t va, void *dest, size_t size) {
     const auto kcb = kcbs_.at(kid).value();
     const auto satp = kcb.satp;
-    va = page_align_down(va);
-    for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
-      const auto chunk_size =
-          std::min(static_cast<size_t>(PAGE_SIZE), size - offset);
-      const auto current_va = va + offset;
-      const auto pa = aspace_->translate(current_va, satp).value();
+    size_t offset = 0;
+    while (offset < size) {
+      const uint32_t page_off = va & (PAGE_SIZE - 1);
+      const size_t chunk_size = std::min(static_cast<size_t>(PAGE_SIZE - page_off), size - offset);
+      const auto pa = aspace_->translate(va, satp).value();
       accelerator_->download((uint8_t *)dest + offset, pa, chunk_size);
+      va += chunk_size;
+      offset += chunk_size;
     }
   }
 
-  void copy_host_to_dev_(kernel_id_t kid, const uint32_t base_va,
+  void copy_host_to_dev_(kernel_id_t kid, uint32_t base_va,
                          const void *content, size_t size) {
     const auto kcb = kcbs_.at(kid).value();
     const auto satp = kcb.satp;
-    for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
-      const auto chunk_size =
-          std::min(static_cast<size_t>(PAGE_SIZE), size - offset);
-      const auto va = base_va + offset;
-      const auto pa = aspace_->translate(va, satp).value(); // assume success
-      accelerator_->upload(pa, (uint8_t *)content + offset, chunk_size);
+    size_t offset = 0;
+    while (offset < size) {
+      const uint32_t page_off = base_va & (PAGE_SIZE - 1);
+      const size_t chunk_size = std::min(static_cast<size_t>(PAGE_SIZE - page_off), size - offset);
+      const auto pa = aspace_->translate(base_va, satp).value();
+      accelerator_->upload(pa, (const uint8_t *)content + offset, chunk_size);
+      base_va += chunk_size;
+      offset += chunk_size;
     }
   }
 
