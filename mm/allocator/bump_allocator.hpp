@@ -36,13 +36,17 @@ public:
   void end_transaction() override {
     mutex_.unlock();
   }
-  std::optional<addr_t> allocate(size_t size) override {
+  auto allocate(size_t size) -> std::optional<addr_t> override {
     if (size == 0) {
-      printf("Error: invalid arguments\n");
+      if (verbose_) {
+        printf("espiral::BumpAllocator: Error: invalid arguments\n");
+      }
       return std::nullopt;
     }
     if (nextAddress_ + size > baseAddress_ + capacity_) {
-      printf("Error: out of memory - requested=0x%lx, next=0x%lx, capacity=0x%lx\n", size, nextAddress_, capacity_);
+      if (verbose_) {
+        printf("espiral::BumpAllocator: Error: out of memory - requested=0x%lx, next=0x%lx, capacity=0x%lx\n", size, nextAddress_, capacity_);
+      }
       return std::nullopt;
     }
     addr_t addr = nextAddress_;
@@ -50,7 +54,7 @@ public:
     return std::optional<addr_t>(addr);
   }
   bool release(addr_t /*addr*/) override {
-    throw std::runtime_error("BumpAllocator does not support release");
+    throw std::runtime_error("espiral::BumpAllocator: Error: does not support release");
   }
 
 private:
@@ -58,5 +62,6 @@ private:
   uint64_t capacity_;
   uint64_t nextAddress_;
   std::mutex mutex_;
+  bool verbose_ = false;
 };
 } // namespace espiral

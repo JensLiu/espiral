@@ -1,11 +1,12 @@
 #pragma once
 
-#include "includes/common.h"
+#include "includes/espiral_common.h"
 #include "mm/address_space_manager.hpp"
 #include "mm/allocator/vortex_memory_allocator.hpp"
 #include "mm/heap_manager.hpp"
 #include "mm/host_accelerator_interface.hpp"
 #include "mm/scratchpad_memory.hpp"
+#include "logger.hpp"
 
 #include <cassert>
 #include <fstream>
@@ -26,6 +27,8 @@ private:
       : va(va), device_max_size(max_size), flags(flags), host_ptr(nullptr), size(0) {}
 
 public:
+  uint32_t get_va() const { return va; }
+
   void set_content(const void *data, size_t data_size) {
     if (data_size > device_max_size) {
       throw std::runtime_error("Data size exceeds buffer capacity");
@@ -63,7 +66,7 @@ class Spinner {
   };
 
 public:
-  Spinner(HostAcceleratorInterface *accelerator) : accelerator_(accelerator) {
+  Spinner(HostAcceleratorInterface *accelerator) : accelerator_(accelerator), logger_("espiral::Spinner") {
     // address space manager
     aspace_ = new AddressSpaceManager(new VortexMemoryAllocator(), new ScratchpadMemory());
   }
@@ -79,6 +82,14 @@ public:
     allocate_user_stack_(kid);
     upload_vxbin_(kid);
     upload_page_table_(kid);
+
+    // debug: print the address mapping
+    const auto kcb = kcbs_.at(kid).value();
+    const auto mapping = aspace_->dump_address_mapping(kcb.satp);
+    for (const auto &[va, pa] : mapping) {
+      logger_.println("Mapping: 0x%x -> 0x%x", va, pa);
+    }
+
     start_kernel_(kid);
   }
 
@@ -120,7 +131,7 @@ public:
         .start_pc_va = 0x80000000,
         .kernel_end_va = static_cast<addr_t>(max_vma),
         .kernel_start_va = static_cast<addr_t>(min_vma),
-        .heap = new HeapManager(aspace_, satp, max_vma),
+        .heap = new HeapManager(aspace_, satp, (max_vma + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)),
     };
 
     kcbs_.at(kid) = kcb;
@@ -136,6 +147,10 @@ public:
     const addr_t va = heap_mngr->allocate(size).value();
     // const uint32_t safe_flags = flags & (pte_flags::R | pte_flags::W);
     return UploadBuffer(va, size, pte_flags::R | pte_flags::W);
+  }
+
+  auto allocate_dev_buffer(kernel_id_t kid, size_t size, uint32_t flags = pte_flags::R | pte_flags::W) -> addr_t {
+    return allocate_upload_buffer(kid, size, flags).va;
   }
 
   void upload(kernel_id_t kid, const UploadBuffer &buffer) {
@@ -162,16 +177,17 @@ private:
     const auto min_vma = kcb.kernel_start_va;
     const auto max_vma = kcb.kernel_end_va;
     const auto bin_size = kcb.vxbin_size;
-    const auto runtime_size = (max_vma - min_vma);
 
-    // allocate virtual memory for the whole binary, including .text, .data and .bss
-    // the actual content will be uploaded later by upload_vxbin_()
-    // memory allocation (reservation)
-    // code segment
-    aspace_->allocate_vm_pages(min_vma, bin_size, satp, pte_flags::R | pte_flags::X);
-    // global variable segment
-    aspace_->allocate_vm_pages(min_vma + bin_size, runtime_size - bin_size, satp,
-                               pte_flags::R | pte_flags::W);
+    const addr_t code_size_aligned = (bin_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    const addr_t data_va = min_vma + code_size_aligned;
+    const addr_t data_size = (max_vma > data_va) ? max_vma - data_va : 0;
+
+    aspace_->allocate_vm_pages(min_vma, code_size_aligned, satp,
+                               pte_flags::R | pte_flags::X);
+    if (data_size > 0) {
+      aspace_->allocate_vm_pages(data_va, data_size, satp,
+                                 pte_flags::R | pte_flags::W);
+    }
   }
 
   void allocate_user_stack_(kernel_id_t kid) {
@@ -285,6 +301,7 @@ private:
   AddressSpaceManager *aspace_;
   // Talks to the Accelerator
   HostAcceleratorInterface *accelerator_;
+  Logger logger_;
 };
 
 } // namespace espiral

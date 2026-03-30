@@ -1,12 +1,20 @@
 #pragma once
 
-#include "../mm/host_accelerator_interface.hpp"
 #include "../mm/address_space_manager.hpp"
-#include "vortex.h"
+#include "../mm/host_accelerator_interface.hpp"
+#include "spinner.hpp"
+
+#include <arch.h>
+#include <bitmanip.h>
+#include <common.h>
+#include <optional>
+#include <processor.h>
+#include <vortex.h>
 
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <iostream>
 #include <unordered_map>
 
 // simx `vx_device` from Vortex
@@ -27,7 +35,15 @@ public:
     }
   }
 
-  int upload(uint64_t dest_addr, const void *src, uint64_t size) override {
+  auto init() -> int override {
+    return 0;
+  }
+
+  auto close() -> int override {
+    return 0;
+  }
+
+  auto upload(addr_t dest_addr, const void *src, size_t size) -> int override {
     uint64_t asize = aligned_size(size, CACHE_BLOCK_SIZE);
     if (dest_addr + asize > GLOBAL_MEM_SIZE)
       return -1;
@@ -39,7 +55,7 @@ public:
     return 0;
   }
 
-  int download(void *dest, uint64_t src_addr, uint64_t size) override {
+  auto download(void *dest, addr_t src_addr, size_t size) -> int override {
     uint64_t asize = aligned_size(size, CACHE_BLOCK_SIZE);
     if (src_addr + asize > GLOBAL_MEM_SIZE)
       return -1;
@@ -48,16 +64,10 @@ public:
     ram_.read((uint8_t *)dest, src_addr, size);
     ram_.enable_acl(true);
 
-    /*DBGPRINT("download %ld bytes from 0x%lx\n", size, src_addr);
-    for (uint64_t i = 0; i < size && i < 1024; i += 4) {
-        DBGPRINT("  0x%lx -> 0x%x\n", src_addr + i, *(uint32_t*)((uint8_t*)dest
-    + i));
-    }*/
-
     return 0;
   }
 
-  int start(uint64_t krnl_addr, uint64_t args_addr, uint64_t satp) override {
+  auto start(addr_t krnl_addr, addr_t args_addr, addr_t satp) -> int override {
     // ensure prior run completed
     if (future_.valid()) {
       future_.wait();
@@ -71,7 +81,9 @@ public:
     // SATP must be configured via set_satp_by_addr, not via DCR write:
     // processor_.dcr_write() only stores to a map; it does not propagate to cores.
     // Extract PT physical base from SV32 satp: bits [21:0] are PPN.
+#ifdef VM_ENABLE
     processor_.set_satp_by_addr(AddressSpaceManager::from_satp(satp));
+#endif
 
     // start new run
     future_ = std::async(std::launch::async, [&] { processor_.run(); });
@@ -82,7 +94,7 @@ public:
     return 0;
   }
 
-  int ready_wait(uint64_t timeout) override {
+  auto ready_wait(size_t timeout) -> int override {
     if (!future_.valid())
       return 0;
     uint64_t timeout_sec = timeout / 1000;
@@ -98,7 +110,7 @@ public:
     return 0;
   }
 
-  int dcr_write(uint32_t addr, uint32_t value) override {
+  auto dcr_write(uint32_t addr, uint32_t value) -> int override {
     if (future_.valid()) {
       future_.wait(); // ensure prior run completed
     }
@@ -107,72 +119,60 @@ public:
     return 0;
   }
 
-  int dcr_read(uint32_t addr, uint32_t *value) const override {
-    return dcrs_.read(addr, value);
+  auto dcr_read(uint32_t addr) -> std::optional<uint32_t> override {
+    uint32_t value;
+    if (dcrs_.read(addr, &value)) {
+      return value;
+    }
+    return std::nullopt;
   }
 
-  int mpm_query(uint32_t addr, uint32_t core_id,
-                uint64_t *value) const override {
+  auto mpm_query(uint32_t addr, uint32_t core_id) -> std::optional<uint64_t> override {
     uint32_t offset = addr - VX_CSR_MPM_BASE;
     if (offset > 31)
-      return -1;
+      return std::nullopt;
     if (mpm_cache_.count(core_id) == 0) {
       uint64_t mpm_mem_addr = IO_MPM_ADDR + core_id * 32 * sizeof(uint64_t);
       CHECK_ERR(this->download(mpm_cache_[core_id].data(), mpm_mem_addr,
                                32 * sizeof(uint64_t)),
-                { return err; });
+                { return std::nullopt; });
     }
-    *value = mpm_cache_.at(core_id).at(offset);
-    return 0;
+    return mpm_cache_.at(core_id).at(offset);
   }
 
-private:
-  int get_caps(uint32_t caps_id, uint64_t *value) {
-    uint64_t _value;
+  auto get_caps(uint32_t caps_id) -> std::optional<uint64_t> override {
     switch (caps_id) {
     case VX_CAPS_VERSION:
-      _value = IMPLEMENTATION_ID;
-      break;
+      return IMPLEMENTATION_ID;
     case VX_CAPS_NUM_THREADS:
-      _value = NUM_THREADS;
-      break;
+      return NUM_THREADS;
     case VX_CAPS_NUM_WARPS:
-      _value = NUM_WARPS;
-      break;
+      return NUM_WARPS;
     case VX_CAPS_NUM_CORES:
-      _value = NUM_CORES * NUM_CLUSTERS;
-      break;
+      return NUM_CORES * NUM_CLUSTERS;
     case VX_CAPS_CACHE_LINE_SIZE:
-      _value = CACHE_BLOCK_SIZE;
-      break;
+      return CACHE_BLOCK_SIZE;
     case VX_CAPS_GLOBAL_MEM_SIZE:
-      _value = GLOBAL_MEM_SIZE;
-      break;
+      return GLOBAL_MEM_SIZE;
     case VX_CAPS_LOCAL_MEM_SIZE:
-      _value = (1 << LMEM_LOG_SIZE);
-      break;
+      return (1 << LMEM_LOG_SIZE);
     case VX_CAPS_ISA_FLAGS:
-      _value = ((uint64_t(MISA_EXT)) << 32) | ((log2floor(XLEN) - 4) << 30) |
-               MISA_STD;
-      break;
+      return ((uint64_t(MISA_EXT)) << 32) | ((vortex::log2floor<uint32_t>(XLEN) - 4) << 30) |
+             MISA_STD;
     case VX_CAPS_NUM_MEM_BANKS:
-      _value = PLATFORM_MEMORY_NUM_BANKS;
-      break;
+      return PLATFORM_MEMORY_NUM_BANKS;
     case VX_CAPS_MEM_BANK_SIZE:
-      _value = 1ull << (MEM_ADDR_WIDTH / PLATFORM_MEMORY_NUM_BANKS);
-      break;
+      return 1ull << (MEM_ADDR_WIDTH / PLATFORM_MEMORY_NUM_BANKS);
     default:
       std::cout << "invalid caps id: " << caps_id << std::endl;
       std::abort();
-      return -1;
+      return std::nullopt;
     }
-    *value = _value;
-    return 0;
   }
 
-  Arch arch_;
-  RAM ram_;
-  Processor processor_;
+  vortex::Arch arch_;
+  vortex::RAM ram_;
+  vortex::Processor processor_;
   DeviceConfig dcrs_;
   std::future<void> future_;
   std::unordered_map<uint32_t, std::array<uint64_t, 32>> mpm_cache_;

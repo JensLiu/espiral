@@ -1,20 +1,22 @@
 #pragma once
 
-#include "../includes/common.h"
+#include "../includes/espiral_common.h"
 
 #include <mutex>
+#include "logger.hpp"
 
 namespace espiral {
 
 class ScratchpadMemory {
 public:
-  ScratchpadMemory() {}
+  ScratchpadMemory() : logger_("espiral::ScratchpadMemory") {}
 
   void begin_transaction() { mutex_.lock(); }
 
   void end_transaction() { mutex_.unlock(); }
 
   auto write(uint64_t addr, const std::vector<uint8_t> &data) -> bool {
+    logger_.log("Writing %zu bytes to address: %lx", data.size(), addr);
     for (size_t i = 0; i < data.size(); ++i) {
       const uint64_t current_addr = addr + i;
       const uint64_t current_page_base =
@@ -31,6 +33,8 @@ public:
   }
 
   auto read(uint64_t addr, size_t size) -> std::vector<uint8_t> {
+    assert(size != 0);
+    logger_.log("Reading %zu bytes from address: %lx", size, addr);
     std::vector<uint8_t> result(size);
     for (size_t i = 0; i < size; ++i) {
       const uint64_t current_addr = addr + i;
@@ -58,5 +62,6 @@ private:
 
   std::mutex mutex_;
   sparse_scratchpad_t page_content_;
+  Logger logger_;
 };
 } // namespace vortex_manager

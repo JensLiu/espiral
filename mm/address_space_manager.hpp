@@ -1,10 +1,12 @@
 #pragma once
 
-#include "../includes/common.h"
+#include "../includes/espiral_common.h"
 #include "allocator/memory_allocator_interface.hpp"
 #include "scratchpad_memory.hpp"
+
 #include <optional>
 #include <stdexcept>
+#include "logger.hpp"
 
 namespace espiral {
 
@@ -19,11 +21,12 @@ class AddressSpaceManager {
 public:
   AddressSpaceManager(MemoryAllocatorInterface *pageAllocator,
                       ScratchpadMemory *scratchpadMemory)
-      : page_allocator_(pageAllocator), scratchpad_(scratchpadMemory) {
-    page_allocator_->init_base_address(GLOBAL_MEM_BASE_ADDR);
-    page_allocator_->init_capacity(GLOBAL_MEM_SIZE);
-    page_allocator_->init_page_alignment(PAGE_SIZE);
-    page_allocator_->init_block_alignment(PAGE_SIZE);
+      : page_allocator_(pageAllocator), scratchpad_(scratchpadMemory), logger_("espiral::AddressSpaceManager") {
+    page_allocator_->init_base_address(ALLOC_BASE_ADDR);
+    page_allocator_->init_capacity(GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR);
+    page_allocator_->init_page_alignment(MEM_PAGE_SIZE);
+    page_allocator_->init_block_alignment(CACHE_BLOCK_SIZE);
+    logger_.log("Initialized with base address: %lx, capacity: %lx, page alignment: %d, block alignment: %d", ALLOC_BASE_ADDR, (GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR), MEM_PAGE_SIZE, CACHE_BLOCK_SIZE);
   }
 
   ~AddressSpaceManager() {
@@ -42,6 +45,7 @@ public:
   void map_addr(uint32_t va, uint32_t pa, satp_t satp,
                 uint32_t flags = pte_flags::R | pte_flags::W) {
     map_addr_inner(va, pa, from_satp(satp), flags);
+    logger_.log("Mapped address: %x to physical address: %x with flags: %x", va, pa, flags);
   }
 
   auto translate_or_else_allocate_page(uint32_t va, satp_t satp) -> int32_t {
@@ -88,6 +92,28 @@ public:
     return dump;
   }
 
+  auto dump_address_mapping(satp_t satp) -> std::vector<std::pair<addr_t, addr_t>> {
+    std::vector<std::pair<addr_t, addr_t>> mapping;
+    dump_address_mapping_inner(from_satp(satp), PT_LEVELS - 1, 0, mapping);
+    return mapping;
+  }
+
+  void dump_address_mapping_inner(uint32_t node_pa, int level, addr_t va_prefix,
+                                  std::vector<std::pair<addr_t, addr_t>> &mapping) {
+    const auto current_node = scratchpad_->read_atomic(node_pa, PAGE_SIZE);
+    for (size_t i = 0; i < PAGE_SIZE; i += PTE_SIZE) {
+      uint32_t pte = *reinterpret_cast<const uint32_t *>(&current_node[i]);
+      if (pte_valid(pte)) {
+        const uint32_t vpn_idx = i / PTE_SIZE;
+        const addr_t va = va_prefix | (vpn_idx << (12 + level * VPN_BITS));
+        if (pte_is_leaf(pte)) {
+          mapping.push_back({va, pte_pa(pte)});
+        } else {
+          dump_address_mapping_inner(pte_pa(pte), level - 1, va, mapping);
+        }
+      }
+    }
+  }
 private:
   auto read_pte(uint32_t addr) -> uint32_t {
     auto bytes = scratchpad_->read(addr, PTE_SIZE);
@@ -107,6 +133,7 @@ private:
 
   void map_addr_inner(uint32_t va, uint32_t pa, uint32_t pgtbl_pa,
                       uint32_t flags) {
+    logger_.log("va: %x, pa: %x, pgtbl_pa: %x, flags: %x", va, pa, pgtbl_pa, flags);
     uint32_t current_pa = pgtbl_pa;
 
     scratchpad_->begin_transaction();
@@ -114,8 +141,9 @@ private:
       const uint32_t vpn_idx = va_vpn(va, level);
       const uint32_t pte_addr = current_pa + vpn_idx * PTE_SIZE;
       uint32_t pte = read_pte(pte_addr);
-
+      logger_.log("level: %d, vpn_idx: %d, pte_addr: %x, pte: %x", level, vpn_idx, pte_addr, pte);
       if (!pte_valid(pte)) {
+        logger_.log("PTE not valid, allocating new page table node");
         const auto new_pa = allocate_page_table_node();
         if (!new_pa) {
           scratchpad_->end_transaction();
@@ -130,8 +158,10 @@ private:
 
     const uint32_t vpn_idx = va_vpn(va, 0);
     const uint32_t pte_addr = current_pa + vpn_idx * PTE_SIZE;
+    logger_.log("leaf_pte_addr: %x", pte_addr);
     uint32_t leaf_pte =
         make_pte(pa, flags | pte_flags::V | pte_flags::A | pte_flags::D);
+    logger_.log("leaf_pte: %x", leaf_pte);
     if (pte_valid(read_pte(pte_addr))) {
       scratchpad_->end_transaction();
       throw std::runtime_error("Virtual address already mapped");
@@ -248,5 +278,6 @@ private:
 
   MemoryAllocatorInterface *page_allocator_;
   ScratchpadMemory *scratchpad_;
+  Logger logger_;
 };
 } // namespace espiral

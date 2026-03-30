@@ -14,8 +14,9 @@
 // Memory Allocator from Vortex
 #pragma once
 
-#include "../../includes/common.h"
+#include "../../includes/espiral_common.h"
 #include "memory_allocator_interface.hpp"
+#include "logger.hpp"
 
 #include <assert.h>
 #include <cstdint>
@@ -29,7 +30,7 @@ namespace espiral {
 class VortexMemoryAllocator : public MemoryAllocatorInterface {
 public:
   VortexMemoryAllocator()
-      : baseAddress_(0), capacity_(0), pageAlign_(0), blockAlign_(0), pages_(nullptr), allocated_(0) {}
+      : baseAddress_(0), capacity_(0), pageAlign_(0), blockAlign_(0), pages_(nullptr), allocated_(0), logger_("espiral::VortexMemoryAllocator") {}
 
   void init_base_address(uint64_t base) override {
     baseAddress_ = base;
@@ -108,7 +109,7 @@ public:
 
   int reserve(uint64_t addr, uint64_t size) {
     if (size == 0) {
-      printf("Error: invalid arguments\n");
+      logger_.log("Error: invalid arguments");
       return -1;
     }
 
@@ -117,14 +118,14 @@ public:
 
     // Check if the reservation is within memory capacity bounds
     if (addr + size > baseAddress_ + capacity_) {
-      printf("Error: address range out of bounds - requested=0x%lx, base+capacity=0x%lx\n", (addr + size), (baseAddress_ + capacity_));
+      logger_.log("Error: address range out of bounds - requested=0x%lx, base+capacity=0x%lx", (addr + size), (baseAddress_ + capacity_));
       return -1;
     }
 
     // Ensure the reservation does not overlap with existing pages
     uint64_t overlapStart, overlapEnd;
     if (hasPageOverlap(addr, size, &overlapStart, &overlapEnd)) {
-      printf("Error: address range overlaps with existing allocation - requested=[0x%lx-0x%lx], existing=[0x%lx, 0x%lx]\n", addr, addr + size, overlapStart, overlapEnd);
+      logger_.log("Error: address range overlaps with existing allocation - requested=[0x%lx-0x%lx], existing=[0x%lx, 0x%lx]", addr, addr + size, overlapStart, overlapEnd);
       return -1;
     }
 
@@ -148,7 +149,7 @@ public:
 
   auto allocate(size_t size) -> std::optional<addr_t> override {
     if (size == 0) {
-      printf("Error: invalid arguments\n");
+      logger_.log("Error: invalid arguments");
       return std::nullopt;
     }
 
@@ -170,12 +171,12 @@ public:
       auto pageSize = alignSize(size, pageAlign_);
       uint64_t pageAddr;
       if (!this->findNextAddress(pageSize, &pageAddr)) {
-        printf("Error: out of memory (Can't find next address)\n");
+        logger_.log("Error: out of memory (Can't find next address)");
         return std::nullopt;
       }
       currPage = this->createPage(pageAddr, pageSize);
       if (nullptr == currPage) {
-        printf("Error: out of memory (Can't create a page)\n");
+        logger_.log("Error: out of memory (Can't create a page)");
         return std::nullopt;
       }
       freeBlock = currPage->findFreeBlock(size);
@@ -203,7 +204,7 @@ public:
 
     // found the corresponding block?
     if (nullptr == usedBlock) {
-      printf("warning: release address not found: 0x%lx\n", static_cast<size_t>(addr));
+      logger_.log("warning: release address not found: 0x%lx", static_cast<size_t>(addr));
       return false;
     }
 
@@ -579,6 +580,7 @@ private:
   uint64_t nextAddress_;
   uint64_t allocated_;
   std::mutex mutex_;
+  Logger logger_;
 };
 
 } // namespace espiral

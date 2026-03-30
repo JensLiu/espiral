@@ -5,11 +5,13 @@
 #include "allocator/memory_allocator_interface.hpp"
 #include "allocator/vortex_memory_allocator.hpp"
 
+#include <cstdio>
+
 namespace espiral {
 class HeapManager {
 
 public:
-  HeapManager(AddressSpaceManager *aspace, addr_t satp, addr_t base_va) : aspace_(aspace), satp_(satp) {
+  HeapManager(AddressSpaceManager *aspace, addr_t satp, addr_t base_va) : aspace_(aspace), satp_(satp), logger_("espiral::HeapManager") {
     vm_allocator_ = new BumpAllocator();
     vm_allocator_->init_base_address(base_va);
     vm_allocator_->init_capacity(0);
@@ -27,9 +29,11 @@ public:
     }
     const addr_t last_va = vm_allocator_->get_base_address() + vm_allocator_->get_capacity();
     const size_t pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    logger_.log("Allocating %zu bytes, need %zu pages", size, pages_needed);
     for (size_t i = 0; i < pages_needed; ++i) {
       aspace_->allocate_one_vm_page(last_va + i * PAGE_SIZE, satp_, pte_flags::R | pte_flags::W);
     }
+    logger_.log("Allocated %zu bytes", pages_needed * PAGE_SIZE);
     vm_allocator_->grow_capacity(pages_needed * PAGE_SIZE);
     return allocate(size);
   }
@@ -42,5 +46,6 @@ private:
   MemoryAllocatorInterface *vm_allocator_;
   addr_t satp_;
   AddressSpaceManager *aspace_;
+  Logger logger_;
 };
 } // namespace espiral
