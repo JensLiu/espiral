@@ -1,9 +1,7 @@
 #pragma once
 
-#include <common.h> // runtime/common/common.h
-#include <VX_config.h>  // hw/VX_config.h
-#include <VX_types.h>  // hw/VX_types.h
 #include <cstdint>
+#include <cstddef>
 #include <unordered_map>
 #include <vector> 
 

@@ -1,14 +1,13 @@
 #pragma once
 
+#include "host_accelerator_interface.hpp"
 #include "../mm/address_space_manager.hpp"
-#include "../mm/host_accelerator_interface.hpp"
-#include "spinner.hpp"
 
-#include <arch.h>
+#include <simx/arch.h>
 #include <bitmanip.h>
 #include <common.h>
 #include <optional>
-#include <processor.h>
+#include <simx/processor.h>
 #include <vortex.h>
 
 #include <chrono>
@@ -27,6 +26,9 @@ public:
         processor_(arch_) {
     // attach memory module
     processor_.attach_ram(&ram_);
+    // BaseDCRS::states_ is not zero-initialized; MPM_CLASS must be 0 (NONE)
+    // or the emulator aborts on any MPM CSR read (mirrors vx_dev_open behavior)
+    processor_.dcr_write(VX_DCR_BASE_MPM_CLASS, 0);
   }
 
   ~SimXDevice() {
@@ -74,10 +76,12 @@ public:
     }
 
     // set kernel info
-    this->dcr_write(VX_DCR_BASE_STARTUP_ADDR0, krnl_addr & 0xffffffff);
-    this->dcr_write(VX_DCR_BASE_STARTUP_ADDR1, krnl_addr >> 32);
-    this->dcr_write(VX_DCR_BASE_STARTUP_ARG0, args_addr & 0xffffffff);
-    this->dcr_write(VX_DCR_BASE_STARTUP_ARG1, args_addr >> 32);
+    const auto krnl_addr64 = static_cast<uint64_t>(krnl_addr);
+    const auto args_addr64 = static_cast<uint64_t>(args_addr);
+    this->dcr_write(VX_DCR_BASE_STARTUP_ADDR0, krnl_addr64 & 0xffffffff);
+    this->dcr_write(VX_DCR_BASE_STARTUP_ADDR1, krnl_addr64 >> 32);
+    this->dcr_write(VX_DCR_BASE_STARTUP_ARG0, args_addr64 & 0xffffffff);
+    this->dcr_write(VX_DCR_BASE_STARTUP_ARG1, args_addr64 >> 32);
     // SATP must be configured via set_satp_by_addr, not via DCR write:
     // processor_.dcr_write() only stores to a map; it does not propagate to cores.
     // Extract PT physical base from SV32 satp: bits [21:0] are PPN.
@@ -172,7 +176,7 @@ public:
 
   vortex::Arch arch_;
   vortex::RAM ram_;
-  vortex::Processor processor_;
+  vortex::simx::Processor processor_;
   DeviceConfig dcrs_;
   std::future<void> future_;
   std::unordered_map<uint32_t, std::array<uint64_t, 32>> mpm_cache_;

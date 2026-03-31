@@ -1,11 +1,12 @@
 #pragma once
 
 #include "includes/espiral_common.h"
+#include <common.h> // IO_BASE_ADDR, STACK_BASE_ADDR, NUM_THREADS, NUM_WARPS, etc.
 #include "logger.hpp"
 #include "mm/address_space_manager.hpp"
 #include "mm/allocator/vortex_memory_allocator.hpp"
 #include "mm/heap_manager.hpp"
-#include "mm/host_accelerator_interface.hpp"
+#include "accelerator/host_accelerator_interface.hpp"
 #include "mm/scratchpad_memory.hpp"
 
 #include <cassert>
@@ -13,44 +14,6 @@
 #include <string>
 
 namespace espiral {
-class UploadBuffer {
-  friend class Spinner;
-
-private:
-  const uint32_t va;
-  const uint32_t device_max_size;
-  const uint32_t flags;
-  const void *host_ptr;
-  size_t size;
-  // created by the Spinner
-  UploadBuffer(uint32_t va, uint32_t max_size, uint32_t flags = pte_flags::R | pte_flags::W)
-      : va(va), device_max_size(max_size), flags(flags), host_ptr(nullptr), size(0) {}
-
-public:
-  uint32_t get_va() const { return va; }
-
-  void set_content(const void *data, size_t data_size) {
-    if (data_size > device_max_size) {
-      throw std::runtime_error("Data size exceeds buffer capacity");
-    }
-    host_ptr = data;
-    size = data_size;
-  }
-};
-
-class DownloadBuffer {
-  friend class Spinner;
-
-private:
-  const uint32_t va;
-  const uint32_t read_size;
-  void *host_ptr;
-
-public:
-  DownloadBuffer(uint32_t va, uint32_t read_size, void *host_ptr)
-      : va(va), read_size(read_size), host_ptr(host_ptr) {}
-};
-
 class Spinner {
   struct KernelControlBlock {
     addr_t satp;
@@ -74,7 +37,6 @@ public:
   ~Spinner() {
     // TODO: safety checks
     delete aspace_;
-    delete accelerator_;
   }
 
   void start_kernel(kernel_id_t kid) {
@@ -140,36 +102,26 @@ public:
     return kid;
   }
 
-  // Allocate a data buffer in the kernel's virtual address space.
-  // Returns the VA. Must be called before upload_page_table().
-  auto allocate_upload_buffer(kernel_id_t kid, size_t size,
-                              uint32_t flags = pte_flags::R | pte_flags::W) -> UploadBuffer {
+  // Allocate a VA in the kernel's heap. Must be called before start_kernel().
+  auto allocate_heap(kernel_id_t kid, size_t size,
+                     uint32_t flags = pte_flags::R | pte_flags::W) -> addr_t {
+    (void)flags; // HeapManager always maps R|W; reserved for future fine-grained control
     const auto kcb = kcbs_.at(kid).value();
-    auto *heap_mngr = kcb.heap;
-    const addr_t va = heap_mngr->allocate(size).value();
-    // const uint32_t safe_flags = flags & (pte_flags::R | pte_flags::W);
-    return UploadBuffer(va, size, pte_flags::R | pte_flags::W);
+    return kcb.heap->allocate(size).value();
   }
 
-  auto allocate_dev_buffer(kernel_id_t kid, size_t size, uint32_t flags = pte_flags::R | pte_flags::W) -> addr_t {
-    return allocate_upload_buffer(kid, size, flags).va;
+  void upload(kernel_id_t kid, addr_t va, const void *ptr, size_t size) {
+    copy_host_to_dev_(kid, va, ptr, size);
   }
 
-  void upload(kernel_id_t kid, const UploadBuffer &buffer) {
-    const auto kcb = kcbs_.at(kid).value();
-    copy_host_to_dev_(kid, buffer.va, buffer.host_ptr, buffer.size);
+  void download(kernel_id_t kid, addr_t va, void *ptr, size_t size) {
+    copy_dev_to_host_(kid, va, ptr, size);
   }
 
-  void download(kernel_id_t kid, const DownloadBuffer &buffer) {
-    copy_dev_to_host_(kid, buffer.va, buffer.host_ptr, buffer.read_size);
-  }
-
-  template <typename T>
-  void upload_args(kernel_id_t kid, const T *args) {
+  void upload_args(kernel_id_t kid, const void *args, size_t size) {
     auto &kcb = kcbs_.at(kid).value();
-    auto *heap_mngr = kcb.heap;
-    kcb.args_va = heap_mngr->allocate(sizeof(T)).value();
-    copy_host_to_dev_(kid, kcb.args_va, args, sizeof(T));
+    kcb.args_va = kcb.heap->allocate(size).value();
+    copy_host_to_dev_(kid, kcb.args_va, args, size);
   }
 
 private:
