@@ -6,9 +6,8 @@ SRC_DIR := $(VORTEX_HOME)/runtime/espiral
 
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors
 CXXFLAGS += -Wno-maybe-uninitialized
-# Need generated headers like VX_types.h from the build tree's hw directory.
-# Prefer $(DESTDIR)/hw when building into a DESTDIR, fall back to source hw.
-CXXFLAGS += -I$(INC_DIR) -I../common -I$(DESTDIR)/hw -I$(ROOT_DIR)/hw -I$(SIM_DIR) -I$(SW_COMMON_DIR) -I$(RT_COMMON_DIR)
+# Need generated headers like VX_config.h and VX_types.h from the sibling build tree's hw directory.
+CXXFLAGS += -I$(INC_DIR) -I../common -I$(DESTDIR)/hw -I$(dir $(DESTDIR))hw -I$(SIM_DIR) -I$(SW_COMMON_DIR) -I$(RT_COMMON_DIR)
 CXXFLAGS += -I$(SRC_DIR)/includes -I$(SRC_DIR)/mm -I$(SRC_DIR)/accelerator -I$(SRC_DIR)
 CXXFLAGS += -DXLEN_$(XLEN) -DVM_ENABLE
 CXXFLAGS += $(CONFIGS)
@@ -25,6 +24,8 @@ LIB_SRCS := $(SRC_DIR)/espiral.cpp
 LIB        := $(DESTDIR)/libespiral.so
 LIB_SIMX   := $(DESTDIR)/libespiral-simx.so
 LIB_RTLSIM := $(DESTDIR)/libespiral-rtlsim.so
+HW_CONFIG_HEADERS := $(dir $(DESTDIR))hw/VX_config.h $(dir $(DESTDIR))hw/VX_types.h
+HW_BUILD_DIR := $(dir $(DESTDIR))hw
 
 CXXFLAGS_ALL := $(CXXFLAGS)
 CXXFLAGS_SIMX   := $(CXXFLAGS) -DESPIRAL_BACKEND_SIMX
@@ -50,14 +51,17 @@ lib-simx: $(LIB_SIMX)
 
 lib-rtlsim: $(LIB_RTLSIM)
 
-$(LIB): $(LIB_SRCS) $(DESTDIR)/libsimx.so $(DESTDIR)/librtlsim.so
+$(LIB): $(LIB_SRCS) $(DESTDIR)/libsimx.so $(DESTDIR)/librtlsim.so $(HW_CONFIG_HEADERS)
 	$(CXX) $(CXXFLAGS_ALL) -shared $< $(LDFLAGS_ALL) -o $@
 
-$(LIB_SIMX): $(LIB_SRCS) $(DESTDIR)/libsimx.so
+$(LIB_SIMX): $(LIB_SRCS) $(DESTDIR)/libsimx.so $(HW_CONFIG_HEADERS)
 	$(CXX) $(CXXFLAGS_SIMX) -shared $< $(LDFLAGS_SIMX) -o $@
 
-$(LIB_RTLSIM): $(LIB_SRCS) $(DESTDIR)/librtlsim.so
+$(LIB_RTLSIM): $(LIB_SRCS) $(DESTDIR)/librtlsim.so $(HW_CONFIG_HEADERS)
 	$(CXX) $(CXXFLAGS_RTLSIM) -shared $< $(LDFLAGS_RTLSIM) -o $@
+
+$(HW_CONFIG_HEADERS): | $(HW_BUILD_DIR)
+	$(MAKE) -C $(HW_BUILD_DIR) config
 
 tests: $(LIB_SIMX) $(TEST_BINS)
 
