@@ -11,7 +11,8 @@ namespace espiral {
 class HeapManager {
 
 public:
-  HeapManager(AddressSpaceManager *aspace, addr_t satp, addr_t base_va) : aspace_(aspace), satp_(satp), logger_("espiral::HeapManager") {
+  HeapManager(AddressSpaceManager *aspace, addr_t top_pgtbl_pa, addr_t base_va) : aspace_(aspace), top_pgtbl_pa_(top_pgtbl_pa), logger_("espiral::HeapManager") {
+    logger_.set_verbose(true);
     vm_allocator_ = new BumpAllocator();
     vm_allocator_->init_base_address(base_va);
     vm_allocator_->init_capacity(0);
@@ -31,7 +32,7 @@ public:
     const size_t pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     logger_.log("Allocating %zu bytes, need %zu pages", size, pages_needed);
     for (size_t i = 0; i < pages_needed; ++i) {
-      aspace_->allocate_one_vm_page(last_va + i * PAGE_SIZE, satp_, pte_flags::R | pte_flags::W);
+      aspace_->allocate_one_vm_page(last_va + i * PAGE_SIZE, top_pgtbl_pa_, pte_flags::R | pte_flags::W);
     }
     logger_.log("Allocated %zu bytes", pages_needed * PAGE_SIZE);
     vm_allocator_->grow_capacity(pages_needed * PAGE_SIZE);
@@ -44,7 +45,7 @@ public:
 
 private:
   MemoryAllocatorInterface *vm_allocator_;
-  addr_t satp_;
+  addr_t top_pgtbl_pa_;
   AddressSpaceManager *aspace_;
   Logger logger_;
 };

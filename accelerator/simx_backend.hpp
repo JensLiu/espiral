@@ -1,7 +1,6 @@
 #pragma once
 
 #include "host_accelerator_interface.hpp"
-#include "../mm/address_space_manager.hpp"
 
 #include <simx/arch.h>
 #include <bitmanip.h>
@@ -69,7 +68,7 @@ public:
     return 0;
   }
 
-  auto start(addr_t krnl_addr, addr_t args_addr, addr_t satp) -> int override {
+  auto start(addr_t krnl_addr, addr_t args_addr, addr_t top_pgtbl_pa) -> int override {
     // ensure prior run completed
     if (future_.valid()) {
       future_.wait();
@@ -86,7 +85,7 @@ public:
     // processor_.dcr_write() only stores to a map; it does not propagate to cores.
     // Extract PT physical base from SV32 satp: bits [21:0] are PPN.
 #ifdef VM_ENABLE
-    processor_.set_satp_by_addr(AddressSpaceManager::from_satp(satp));
+    processor_.set_satp_by_addr(top_pgtbl_pa);
 #endif
 
     // start new run

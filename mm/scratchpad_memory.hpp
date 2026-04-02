@@ -9,7 +9,9 @@ namespace espiral {
 
 class ScratchpadMemory {
 public:
-  ScratchpadMemory() : logger_("espiral::ScratchpadMemory") {}
+  ScratchpadMemory() : logger_("espiral::ScratchpadMemory") {
+    logger_.set_verbose(true);
+  }
 
   void begin_transaction() { mutex_.lock(); }
 
