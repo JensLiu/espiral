@@ -3,18 +3,31 @@
 #include "accelerator/simx_backend.hpp"
 #include "accelerator/rtlsim_backend.hpp"
 
+#include <cstdio>
 #include <stdexcept>
 
 namespace espiral {
 
 Espiral::Espiral(int backend_type) {
+  std::fprintf(stderr, "[espiral::Espiral] ctor begin, backend_type=%d\n", backend_type);
   switch (backend_type) {
-    case backend::SIMX:      accelerator_ = new SimXDevice();    break;
-    case backend::VERILATOR: accelerator_ = new RtlSimDevice();  break;
+    case backend::SIMX:
+      std::fprintf(stderr, "[espiral::Espiral] creating SimXDevice\n");
+      accelerator_ = new SimXDevice();
+      break;
+    case backend::VERILATOR:
+      std::fprintf(stderr, "[espiral::Espiral] creating RtlSimDevice\n");
+      accelerator_ = new RtlSimDevice();
+      break;
     default: throw std::invalid_argument("Unknown backend type");
   }
+  std::fprintf(stderr, "[espiral::Espiral] accelerator created=%p\n", (void*)accelerator_);
+  std::fprintf(stderr, "[espiral::Espiral] calling accelerator_->init()\n");
   accelerator_->init();
+  std::fprintf(stderr, "[espiral::Espiral] accelerator init complete\n");
+  std::fprintf(stderr, "[espiral::Espiral] creating Spinner\n");
   spinner_ = new Spinner(accelerator_);
+  std::fprintf(stderr, "[espiral::Espiral] spinner created=%p\n", (void*)spinner_);
 }
 
 Espiral::~Espiral() {

@@ -4,9 +4,10 @@
 #include "allocator/memory_allocator_interface.hpp"
 #include "scratchpad_memory.hpp"
 
+#include "logger.hpp"
+#include <cstdio>
 #include <optional>
 #include <stdexcept>
-#include "logger.hpp"
 
 namespace espiral {
 
@@ -22,10 +23,16 @@ public:
   AddressSpaceManager(MemoryAllocatorInterface *pageAllocator,
                       ScratchpadMemory *scratchpadMemory)
       : page_allocator_(pageAllocator), scratchpad_(scratchpadMemory), logger_("espiral::AddressSpaceManager") {
+    logger_.set_verbose(true);
+    logger_.println("ctor begin, page_allocator=%p scratchpad=%p", (void *)page_allocator_, (void *)scratchpad_);
     page_allocator_->init_base_address(ALLOC_BASE_ADDR);
+    logger_.println("init_base_address done");
     page_allocator_->init_capacity(GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR);
+    logger_.println("init_capacity done");
     page_allocator_->init_page_alignment(MEM_PAGE_SIZE);
+    logger_.println("init_page_alignment done");
     page_allocator_->init_block_alignment(CACHE_BLOCK_SIZE);
+    logger_.println("init_block_alignment done");
     logger_.log("Initialized with base address: %lx, capacity: %lx, page alignment: %d, block alignment: %d", ALLOC_BASE_ADDR, (GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR), MEM_PAGE_SIZE, CACHE_BLOCK_SIZE);
   }
 
@@ -34,67 +41,68 @@ public:
     delete scratchpad_;
   }
 
-  auto allocate_page_table() -> std::optional<satp_t> {
+  auto allocate_page_table() -> std::optional<addr_t> {
     if (auto pgtbl_pa = allocate_page_table_node()) {
       scratchpad_->write_atomic(*pgtbl_pa, std::vector<uint8_t>(PAGE_SIZE, 0));
-      return make_satp(*pgtbl_pa);
+      logger_.log("Allocated page table at physical address: %x", *pgtbl_pa);
+      return *pgtbl_pa;
     }
+    logger_.log("Failed to allocate page table");
     return std::nullopt;
   }
 
-  void map_addr(uint32_t va, uint32_t pa, satp_t satp,
-                uint32_t flags = pte_flags::R | pte_flags::W) {
-    map_addr_inner(va, pa, from_satp(satp), flags);
+  void map_addr(uint32_t va, uint32_t pa, addr_t top_pgtbl_pa, uint32_t flags = pte_flags::R | pte_flags::W) {
+    map_addr_inner(va, pa, top_pgtbl_pa, flags);
     logger_.log("Mapped address: %x to physical address: %x with flags: %x", va, pa, flags);
   }
 
-  auto translate_or_else_allocate_page(uint32_t va, satp_t satp) -> int32_t {
-    const auto pa = translate(va, satp);
+  auto translate_or_else_allocate_page(uint32_t va, addr_t top_pgtbl_pa) -> int32_t {
+    const auto pa = translate(va, top_pgtbl_pa);
     if (!pa.has_value()) {
-      allocate_one_vm_page(va, satp);
-      return translate(va, satp).value();
+      allocate_one_vm_page(va, top_pgtbl_pa);
+      return translate(va, top_pgtbl_pa).value();
     }
     return *pa;
   }
 
-  auto translate(uint32_t va, satp_t satp) -> std::optional<uint32_t> {
+  auto translate(uint32_t va, addr_t top_pgtbl_pa) -> std::optional<uint32_t> {
     try {
-      return page_table_walk(va, from_satp(satp));
+      return page_table_walk(va, top_pgtbl_pa);
     } catch (const PageFaultException &e) {
       return std::nullopt;
     }
   }
 
-  void free_page_table(satp_t satp) {
-    free_page_table_inner(from_satp(satp), PT_LEVELS - 1);
+  void free_page_table(addr_t top_pgtbl_pa) {
+    free_page_table_inner(top_pgtbl_pa, PT_LEVELS - 1);
   }
 
-  void allocate_vm_pages(uint32_t va, uint32_t size, satp_t satp,
+  void allocate_vm_pages(uint32_t va, uint32_t size, addr_t top_pgtbl_pa,
                          uint32_t flags = pte_flags::R | pte_flags::W) {
     for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE) {
-      allocate_one_vm_page(va + offset, satp, flags);
+      allocate_one_vm_page(va + offset, top_pgtbl_pa, flags);
     }
   }
 
-  void allocate_one_vm_page(uint32_t va, satp_t satp, uint32_t flags = pte_flags::R | pte_flags::W) {
+  void allocate_one_vm_page(uint32_t va, addr_t top_pgtbl_pa, uint32_t flags = pte_flags::R | pte_flags::W) {
 
     auto pa = page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
     if (pa == 0) {
       throw std::runtime_error("Failed to allocate physical page for VM");
     }
     // check if the va is already mapped
-    map_addr(va, pa, satp, flags);
+    map_addr(va, pa, top_pgtbl_pa, flags);
   }
 
-  auto dump_page_table(satp_t satp) -> sparse_scratchpad_t {
+  auto dump_page_table(addr_t top_pgtbl_pa) -> sparse_scratchpad_t {
     sparse_scratchpad_t dump;
-    dump_page_table_inner(from_satp(satp), dump);
+    dump_page_table_inner(top_pgtbl_pa, dump);
     return dump;
   }
 
-  auto dump_address_mapping(satp_t satp) -> std::vector<std::pair<addr_t, addr_t>> {
+  auto dump_address_mapping(addr_t top_pgtbl_pa) -> std::vector<std::pair<addr_t, addr_t>> {
     std::vector<std::pair<addr_t, addr_t>> mapping;
-    dump_address_mapping_inner(from_satp(satp), PT_LEVELS - 1, 0, mapping);
+    dump_address_mapping_inner(top_pgtbl_pa, PT_LEVELS - 1, 0, mapping);
     return mapping;
   }
 
@@ -114,6 +122,7 @@ public:
       }
     }
   }
+
 private:
   auto read_pte(uint32_t addr) -> uint32_t {
     auto bytes = scratchpad_->read(addr, PTE_SIZE);
@@ -131,10 +140,10 @@ private:
     scratchpad_->write(addr, buf);
   }
 
-  void map_addr_inner(uint32_t va, uint32_t pa, uint32_t pgtbl_pa,
+  void map_addr_inner(uint32_t va, uint32_t pa, uint32_t top_pgtbl_pa,
                       uint32_t flags) {
-    logger_.log("va: %x, pa: %x, pgtbl_pa: %x, flags: %x", va, pa, pgtbl_pa, flags);
-    uint32_t current_pa = pgtbl_pa;
+    logger_.log("va: %x, pa: %x, top_pgtbl_pa: %x, flags: %x", va, pa, top_pgtbl_pa, flags);
+    uint32_t current_pa = top_pgtbl_pa;
 
     scratchpad_->begin_transaction();
     for (int level = PT_LEVELS - 1; level > 0; --level) {
@@ -209,6 +218,7 @@ private:
     const uint64_t addr_64 =
         page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
     if (addr_64 != 0) {
+      logger_.log("Allocated page table node at physical address: %x", addr_64);
       return static_cast<uint32_t>(addr_64);
     }
     return std::nullopt;
@@ -247,11 +257,19 @@ private:
   // SV32 configuration
 public:
   // SV32 satp: bit[31]=1 (SV32 mode), bits[30:22]=ASID=0, bits[21:0]=PPN
-  static auto make_satp(addr_t pgtbl_pa) -> satp_t {
+  static auto make_satp_sv32(addr_t pgtbl_pa) -> uint32_t {
     return (1u << 31) | ((pgtbl_pa >> 12) & 0x3FFFFFu);
   }
-  static auto from_satp(satp_t satp) -> addr_t {
+  static auto from_satp_sv32(satp_t satp) -> addr_t {
     return (satp & 0x3FFFFFu) << 12;
+  }
+
+  static auto make_satp_sv64(addr_t pgtbl_pa) -> uint64_t {
+    return (8ull << 60) | ((pgtbl_pa >> 12) & 0xFFFFFFFFFFFu);
+  }
+  
+  static auto from_satp_sv64(satp_t satp) -> addr_t {
+    return (satp & 0xFFFFFFFFFFFu) << 12;
   }
 
 private:

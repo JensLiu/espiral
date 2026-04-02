@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host_accelerator_interface.hpp"
+#include "../mm/address_space_manager.hpp"
 
 #include <bitmanip.h>
 #include <common.h>
@@ -23,7 +24,9 @@ public:
                     GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR,
                     RAM_PAGE_SIZE,
                     CACHE_BLOCK_SIZE) {
+    std::cout << "[RtlSimDevice] ctor begin" << std::endl;
     processor_.attach_ram(&ram_);
+    std::cout << "[RtlSimDevice] ctor complete" << std::endl;
   }
 
   auto init() -> int override {
@@ -89,7 +92,7 @@ public:
     return 0;
   }
 
-  auto start(addr_t krnl_addr, addr_t args_addr, addr_t satp) -> int override {
+  auto start(addr_t krnl_addr, addr_t args_addr, addr_t top_pgtbl_pa) -> int override {
     // ensure prior run completed
     if (future_.valid()) {
       future_.wait();
@@ -98,13 +101,14 @@ public:
     // set kernel info
     const auto krnl_addr64 = static_cast<uint64_t>(krnl_addr);
     const auto args_addr64 = static_cast<uint64_t>(args_addr);
-    const auto satp64 = static_cast<uint64_t>(satp);
+    // TODO: Support for 64-bit address space (SV39) if needed
+    const uint32_t satp = AddressSpaceManager::make_satp_sv32(top_pgtbl_pa);
     this->dcr_write(VX_DCR_BASE_STARTUP_ADDR0, krnl_addr64 & 0xffffffff);
     this->dcr_write(VX_DCR_BASE_STARTUP_ADDR1, krnl_addr64 >> 32);
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG0, args_addr64 & 0xffffffff);
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG1, args_addr64 >> 32);
-    this->dcr_write(VX_DCR_BASE_SATP_BASE_ADDR0, satp64 & 0xffffffff);
-    this->dcr_write(VX_DCR_BASE_SATP_BASE_ADDR1, satp64 >> 32);
+    this->dcr_write(VX_DCR_BASE_SATP_BASE_ADDR0, satp & 0xffffffff);
+    // this->dcr_write(VX_DCR_BASE_SATP_BASE_ADDR1, 0);
 
     // start new run
     future_ = std::async(std::launch::async, [&] {

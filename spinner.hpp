@@ -10,13 +10,14 @@
 #include "mm/scratchpad_memory.hpp"
 
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <string>
 
 namespace espiral {
 class Spinner {
   struct KernelControlBlock {
-    addr_t satp;
+    addr_t top_pgtbl_pa;
     std::string vxbin_path;
     size_t vxbin_size;
     addr_t args_va;
@@ -30,8 +31,12 @@ class Spinner {
 
 public:
   Spinner(HostAcceleratorInterface *accelerator) : accelerator_(accelerator), logger_("espiral::Spinner") {
+    logger_.set_verbose(true);
+    logger_.log("ctor begin, accelerator=%p", (void*)accelerator_);
     // address space manager
+    logger_.log("creating AddressSpaceManager");
     aspace_ = new AddressSpaceManager(new VortexMemoryAllocator(), new ScratchpadMemory());
+    logger_.log("AddressSpaceManager created=%p", (void*)aspace_);
   }
 
   ~Spinner() {
@@ -40,6 +45,7 @@ public:
   }
 
   void start_kernel(kernel_id_t kid) {
+    logger_.log("start_kernel begin, kid=%u, top_pgtbl_pa=%x", kid, kcbs_.at(kid).value().top_pgtbl_pa);
     // mapping
     allocate_vxbin_segments_(kid);
     allocate_user_stack_(kid);
@@ -49,9 +55,9 @@ public:
     upload_page_table_(kid);
     // debug: print the address mapping
     const auto kcb = kcbs_.at(kid).value();
-    const auto mapping = aspace_->dump_address_mapping(kcb.satp);
+    const auto mapping = aspace_->dump_address_mapping(kcb.top_pgtbl_pa);
     for (const auto &[va, pa] : mapping) {
-      logger_.println("Mapping: 0x%x -> 0x%x", va, pa);
+      logger_.log("Mapping: 0x%x -> 0x%x", va, pa);
     }
 
     start_kernel_(kid);
@@ -65,18 +71,19 @@ public:
   void free_kernel(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
     delete kcb.heap;
-    aspace_->free_page_table(kcb.satp);
+    aspace_->free_page_table(kcb.top_pgtbl_pa);
     free_kcb_(kid);
   }
 
   auto allocate_kernel(std::string vxbin_path) -> kernel_id_t {
     const kernel_id_t kid = allocate_kcb_();
-    const auto satp_opt = aspace_->allocate_page_table();
-    if (!satp_opt.has_value()) {
+    const auto pgtbl_opt = aspace_->allocate_page_table();
+    if (!pgtbl_opt.has_value()) {
       free_kcb_(kid);
       throw std::runtime_error("Failed to allocate page table for kernel");
     }
-    const satp_t satp = *satp_opt;
+    const satp_t pgtbl_pa = *pgtbl_opt;
+    logger_.log("Allocated page table with satp: %x for kernel id: %u", pgtbl_pa, kid);
 
     // parse vxbin and load segments to memory
     const auto vxbin_content = read_vxbin_(vxbin_path);
@@ -88,14 +95,14 @@ public:
     const auto runtime_size = (max_vma - min_vma);
 
     KernelControlBlock kcb{
-        .satp = satp,
+        .top_pgtbl_pa = pgtbl_pa,
         .vxbin_path = vxbin_path,
         .vxbin_size = bin_size,
         .args_va = 0,
         .start_pc_va = 0x80000000,
         .kernel_end_va = static_cast<addr_t>(max_vma),
         .kernel_start_va = static_cast<addr_t>(min_vma),
-        .heap = new HeapManager(aspace_, satp, (max_vma + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)),
+        .heap = new HeapManager(aspace_, pgtbl_pa, (max_vma + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)),
     };
 
     kcbs_.at(kid) = kcb;
@@ -127,15 +134,15 @@ public:
 private:
   void allocate_io_pages_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
+    const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
     const auto io_size = IO_END_ADDR - IO_BASE_ADDR;
-    aspace_->allocate_vm_pages(IO_BASE_ADDR, io_size, satp,
+    aspace_->allocate_vm_pages(IO_BASE_ADDR, io_size, top_pgtbl_pa,
                                pte_flags::R | pte_flags::W);
   }
 
   void allocate_vxbin_segments_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
+    const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
     const auto min_vma = kcb.kernel_start_va;
     const auto max_vma = kcb.kernel_end_va;
     const auto bin_size = kcb.vxbin_size;
@@ -150,24 +157,24 @@ private:
 
     if (shared_boundary) {
       if (last_code_page > min_vma) {
-        aspace_->allocate_vm_pages(min_vma, last_code_page - min_vma, satp,
+        aspace_->allocate_vm_pages(min_vma, last_code_page - min_vma, top_pgtbl_pa,
                                    pte_flags::R | pte_flags::W | pte_flags::X);
       }
-      aspace_->allocate_one_vm_page(last_code_page, satp,
+      aspace_->allocate_one_vm_page(last_code_page, top_pgtbl_pa,
                                     pte_flags::R | pte_flags::W | pte_flags::X);
       const addr_t next_page = last_code_page + PAGE_SIZE;
       if (max_vma > next_page) {
-        aspace_->allocate_vm_pages(next_page, max_vma - next_page, satp,
+        aspace_->allocate_vm_pages(next_page, max_vma - next_page, top_pgtbl_pa,
                                    pte_flags::R | pte_flags::W);
       }
     } else {
       // no code-data shared boundary
       const addr_t code_size_aligned = (bin_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-      aspace_->allocate_vm_pages(min_vma, code_size_aligned, satp,
+      aspace_->allocate_vm_pages(min_vma, code_size_aligned, top_pgtbl_pa,
                                  pte_flags::R | pte_flags::X);
       const addr_t data_va = min_vma + code_size_aligned;
       if (has_data && max_vma > data_va) {
-        aspace_->allocate_vm_pages(data_va, max_vma - data_va, satp,
+        aspace_->allocate_vm_pages(data_va, max_vma - data_va, top_pgtbl_pa,
                                    pte_flags::R | pte_flags::W);
       }
     }
@@ -180,14 +187,14 @@ private:
     const uint32_t stack_size = per_stack_size * NUM_THREADS * NUM_WARPS * NUM_CORES * NUM_CLUSTERS;
     const uint32_t stack_top_va = STACK_BASE_ADDR;
     const uint32_t stack_base_va = stack_top_va - stack_size;
-    aspace_->allocate_vm_pages(stack_base_va, stack_size, kcb.satp,
+    aspace_->allocate_vm_pages(stack_base_va, stack_size, kcb.top_pgtbl_pa,
                                pte_flags::R | pte_flags::W);
   }
 
   void upload_page_table_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
-    const auto pt_content = aspace_->dump_page_table(satp);
+    const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
+    const auto pt_content = aspace_->dump_page_table(top_pgtbl_pa);
     upload_sparse_scratchpad_(kid, pt_content);
   }
 
@@ -206,7 +213,9 @@ private:
   void upload_sparse_scratchpad_(kernel_id_t kid,
                                  const sparse_scratchpad_t &data) {
     const auto kcb = kcbs_.at(kid).value();
+    logger_.log("Uploading sparse scratchpad with %zu entries", data.size());
     for (const auto &[pa, content] : data) {
+      logger_.log("Uploading to scratchpad: pa=%x, size=%zu", pa, content.size());
       accelerator_->upload(pa, content.data(), content.size());
     }
   }
@@ -244,12 +253,12 @@ private:
 
   void copy_dev_to_host_(kernel_id_t kid, uint32_t va, void *dest, size_t size) {
     const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
+    const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
     size_t offset = 0;
     while (offset < size) {
       const uint32_t page_off = va & (PAGE_SIZE - 1);
       const size_t chunk_size = std::min(static_cast<size_t>(PAGE_SIZE - page_off), size - offset);
-      const auto pa = aspace_->translate(va, satp).value();
+      const auto pa = aspace_->translate(va, top_pgtbl_pa).value();
       accelerator_->download((uint8_t *)dest + offset, pa, chunk_size);
       va += chunk_size;
       offset += chunk_size;
@@ -259,12 +268,12 @@ private:
   void copy_host_to_dev_(kernel_id_t kid, uint32_t base_va,
                          const void *content, size_t size) {
     const auto kcb = kcbs_.at(kid).value();
-    const auto satp = kcb.satp;
+    const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
     size_t offset = 0;
     while (offset < size) {
       const uint32_t page_off = base_va & (PAGE_SIZE - 1);
       const size_t chunk_size = std::min(static_cast<size_t>(PAGE_SIZE - page_off), size - offset);
-      const auto pa = aspace_->translate(base_va, satp).value();
+      const auto pa = aspace_->translate(base_va, top_pgtbl_pa).value();
       accelerator_->upload(pa, (const uint8_t *)content + offset, chunk_size);
       base_va += chunk_size;
       offset += chunk_size;
@@ -277,7 +286,7 @@ private:
 
   void start_kernel_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
-    accelerator_->start(kcb.start_pc_va, kcb.args_va, kcb.satp);
+    accelerator_->start(kcb.start_pc_va, kcb.args_va, kcb.top_pgtbl_pa);
   }
 
   std::mutex kcb_mutex_;
