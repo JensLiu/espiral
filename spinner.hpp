@@ -1,18 +1,21 @@
 #pragma once
 
+#include "accelerator/host_accelerator_interface.hpp"
 #include "includes/espiral_common.h"
-#include <common.h> // IO_BASE_ADDR, STACK_BASE_ADDR, NUM_THREADS, NUM_WARPS, etc.
 #include "logger.hpp"
 #include "mm/address_space_manager.hpp"
 #include "mm/allocator/vortex_memory_allocator.hpp"
 #include "mm/heap_manager.hpp"
-#include "accelerator/host_accelerator_interface.hpp"
 #include "mm/scratchpad_memory.hpp"
+#include "vortex.h"
+#include <common.h> // IO_BASE_ADDR, STACK_BASE_ADDR, NUM_THREADS, NUM_WARPS, etc.
 
 #include <cassert>
 #include <cstdio>
 #include <fstream>
+#include <optional>
 #include <string>
+#include <cmath>
 
 namespace espiral {
 class Spinner {
@@ -32,11 +35,11 @@ class Spinner {
 public:
   Spinner(HostAcceleratorInterface *accelerator) : accelerator_(accelerator), logger_("espiral::Spinner") {
     logger_.set_verbose(true);
-    logger_.log("ctor begin, accelerator=%p", (void*)accelerator_);
+    logger_.log("ctor begin, accelerator=%p", (void *)accelerator_);
     // address space manager
     logger_.log("creating AddressSpaceManager");
     aspace_ = new AddressSpaceManager(new VortexMemoryAllocator(), new ScratchpadMemory());
-    logger_.log("AddressSpaceManager created=%p", (void*)aspace_);
+    logger_.log("AddressSpaceManager created=%p", (void *)aspace_);
   }
 
   ~Spinner() {
@@ -136,8 +139,11 @@ private:
     const auto kcb = kcbs_.at(kid).value();
     const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
     const auto io_size = IO_END_ADDR - IO_BASE_ADDR;
-    aspace_->allocate_vm_pages(IO_BASE_ADDR, io_size, top_pgtbl_pa,
-                               pte_flags::R | pte_flags::W);
+    aspace_->allocate_vm_pages(
+      IO_BASE_ADDR,
+      io_size,
+      top_pgtbl_pa,
+      pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
   }
 
   void allocate_vxbin_segments_(kernel_id_t kid) {
@@ -157,38 +163,72 @@ private:
 
     if (shared_boundary) {
       if (last_code_page > min_vma) {
-        aspace_->allocate_vm_pages(min_vma, last_code_page - min_vma, top_pgtbl_pa,
-                                   pte_flags::R | pte_flags::W | pte_flags::X);
+        aspace_->allocate_vm_pages(
+            min_vma,
+            last_code_page - min_vma,
+            top_pgtbl_pa,
+            pte_flags::R | pte_flags::W | pte_flags::X | pte_flags::U | pte_flags::A | pte_flags::D);
       }
       aspace_->allocate_one_vm_page(last_code_page, top_pgtbl_pa,
-                                    pte_flags::R | pte_flags::W | pte_flags::X);
+                                    pte_flags::R | pte_flags::W | pte_flags::X | pte_flags::U | pte_flags::A | pte_flags::D);
       const addr_t next_page = last_code_page + PAGE_SIZE;
       if (max_vma > next_page) {
-        aspace_->allocate_vm_pages(next_page, max_vma - next_page, top_pgtbl_pa,
-                                   pte_flags::R | pte_flags::W);
+        aspace_->allocate_vm_pages(
+            next_page,
+            max_vma - next_page,
+            top_pgtbl_pa,
+            pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
       }
     } else {
       // no code-data shared boundary
       const addr_t code_size_aligned = (bin_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-      aspace_->allocate_vm_pages(min_vma, code_size_aligned, top_pgtbl_pa,
-                                 pte_flags::R | pte_flags::X);
+      aspace_->allocate_vm_pages(
+          min_vma,
+          code_size_aligned,
+          top_pgtbl_pa,
+          pte_flags::R | pte_flags::X | pte_flags::U | pte_flags::A);
       const addr_t data_va = min_vma + code_size_aligned;
       if (has_data && max_vma > data_va) {
-        aspace_->allocate_vm_pages(data_va, max_vma - data_va, top_pgtbl_pa,
-                                   pte_flags::R | pte_flags::W);
+        aspace_->allocate_vm_pages(
+            data_va,
+            max_vma - data_va,
+            top_pgtbl_pa,
+            pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
       }
     }
   }
 
   void allocate_user_stack_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
-    const size_t per_stack_size = 1 << STACK_LOG2_SIZE;
-    // reserve maximum possible stack space
-    const uint32_t stack_size = per_stack_size * NUM_THREADS * NUM_WARPS * NUM_CORES * NUM_CLUSTERS;
-    const uint32_t stack_top_va = STACK_BASE_ADDR;
+    const uint64_t per_stack_size = (1ull << STACK_LOG2_SIZE);
+
+    // mhartid is encoded as core/warp/thread bitfields in RTL.
+    // Size stack by max encoded hart ID to avoid under-mapping sparse IDs.
+    // look into `VX_csr_uint.sv` for mheartid encoding details
+    const uint32_t num_threads = accelerator_->get_caps(VX_CAPS_NUM_THREADS).value_or( NUM_THREADS);
+    const uint32_t num_warps = accelerator_->get_caps(VX_CAPS_NUM_WARPS).value_or(NUM_WARPS);
+    const uint32_t num_cores = accelerator_->get_caps(VX_CAPS_NUM_CORES).value_or(NUM_CORES * NUM_CLUSTERS);
+    // const uint32_t num_cores = 4;
+
+    const uint32_t nt_bits = std::ceil(std::log2(num_threads));
+    const uint32_t nw_bits = std::ceil(std::log2(num_warps));
+    const uint64_t max_hartid = ((uint64_t)(num_cores - 1) << (nw_bits + nt_bits))
+                              + ((uint64_t)(num_warps - 1) << nt_bits)
+                              + (num_threads - 1);
+    const uint64_t n_stack_slots = max_hartid + 1;
+    const uint64_t stack_size_64 = per_stack_size * n_stack_slots;
+    const uint64_t stack_top_va_64 = STACK_BASE_ADDR;
+
+    const uint32_t stack_size = static_cast<uint32_t>(stack_size_64);
+    const uint32_t stack_top_va = static_cast<uint32_t>(stack_top_va_64);
     const uint32_t stack_base_va = stack_top_va - stack_size;
-    aspace_->allocate_vm_pages(stack_base_va, stack_size, kcb.top_pgtbl_pa,
-                               pte_flags::R | pte_flags::W);
+    aspace_->allocate_vm_pages(
+      stack_base_va,
+      stack_size,
+      kcb.top_pgtbl_pa,
+      pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
+    logger_.log("Allocated user stack for kernel id: %u, stack_base_va: %x, stack_top_va: %x, stack_size: %u bytes, slots: %u, cores=%u, warps=%u, threads=%u",
+                kid, stack_base_va, stack_top_va, stack_size, (uint32_t)n_stack_slots, num_cores, num_warps, num_threads);
   }
 
   void upload_page_table_(kernel_id_t kid) {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../common/common.h"
+
 #include "../includes/espiral_common.h"
 #include "allocator/memory_allocator_interface.hpp"
 #include "scratchpad_memory.hpp"

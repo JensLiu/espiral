@@ -35,7 +35,7 @@ public:
   }
 
   auto read(uint64_t addr, size_t size) -> std::vector<uint8_t> {
-    assert(size != 0);
+    // assert(size != 0);
     logger_.log("Reading %zu bytes from address: %lx", size, addr);
     std::vector<uint8_t> result(size);
     for (size_t i = 0; i < size; ++i) {

@@ -32,7 +32,10 @@ public:
     const size_t pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     logger_.log("Allocating %zu bytes, need %zu pages", size, pages_needed);
     for (size_t i = 0; i < pages_needed; ++i) {
-      aspace_->allocate_one_vm_page(last_va + i * PAGE_SIZE, top_pgtbl_pa_, pte_flags::R | pte_flags::W);
+      aspace_->allocate_one_vm_page(
+          last_va + i * PAGE_SIZE,
+          top_pgtbl_pa_,
+          pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
     }
     logger_.log("Allocated %zu bytes", pages_needed * PAGE_SIZE);
     vm_allocator_->grow_capacity(pages_needed * PAGE_SIZE);
