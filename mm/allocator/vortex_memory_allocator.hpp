@@ -70,20 +70,6 @@ public:
     }
   }
   
-  void set_hole_list(const std::unordered_map<addr_t, size_t> &holes) override {
-    if (holeList_.has_value()) {
-      throw std::runtime_error("Hole list already set, cannot set again");
-    }
-    holeList_ = holes;
-  }
-
-  void get_hole_list(std::unordered_map<addr_t, size_t> &holes) const {
-    if (!holeList_.has_value()) {
-      throw std::runtime_error("Hole list not set");
-    }
-    holes = *holeList_;
-  }
-  
   ~VortexMemoryAllocator() {
     // Free allocated pages
     page_t *currPage = pages_;
@@ -167,7 +153,7 @@ public:
     return reserve(addr, size);
   }
 
-  auto _allocate_ignorant_of_holes(size_t size) -> std::optional<addr_t> override {
+  auto allocate(size_t size) -> std::optional<addr_t> override {
     if (size == 0) {
       logger_.log("Error: invalid arguments");
       return std::nullopt;
@@ -211,7 +197,7 @@ public:
     return std::optional<addr_t>(freeBlock->addr);
   }
 
-  auto _release_ignorant_of_holes(addr_t addr) -> bool override {
+  auto release(addr_t addr) -> bool override {
     // Walk all pages to find the pointer
     block_t *usedBlock = nullptr;
     auto currPage = pages_;
@@ -601,7 +587,6 @@ private:
   uint64_t allocated_;
   std::mutex mutex_;
   Logger logger_;
-  std::optional<std::unordered_map<addr_t, size_t>> holeList_;
 };
 
 } // namespace espiral

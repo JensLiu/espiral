@@ -5,12 +5,14 @@
 #include "../includes/espiral_common.h"
 #include "accelerator/host_accelerator_interface.hpp"
 #include "allocator/memory_allocator_interface.hpp"
+#include "hole_list.hpp"
 #include "scratchpad_memory.hpp"
 
 #include "logger.hpp"
 #include <cstdio>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace espiral {
 
@@ -39,10 +41,8 @@ public:
     logger_.log("Initialized with base address: %lx, capacity: %lx, page alignment: %d, block alignment: %d", ALLOC_BASE_ADDR, (GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR), MEM_PAGE_SIZE, CACHE_BLOCK_SIZE);
     page_allocator_->set_growable(false);
     // reserve these regions so that we can do identity mapping for them later
-    page_allocator_->set_hole_list({
-      {IO_BASE_ADDR, IO_END_ADDR - IO_BASE_ADDR},
-      {LMEM_BASE_ADDR, accelerator->get_caps(VX_CAPS_LOCAL_MEM_SIZE).value_or(0)},
-    });
+    hole_list_.add_hole(IO_BASE_ADDR, IO_END_ADDR - IO_BASE_ADDR);
+    hole_list_.add_hole(LMEM_BASE_ADDR, accelerator->get_caps(VX_CAPS_LOCAL_MEM_SIZE).value_or(0));
     logger_.log("Set hole list for IO and LMEM");
   }
 
@@ -102,7 +102,7 @@ public:
 
   void allocate_one_vm_page(uint32_t va, addr_t top_pgtbl_pa, uint32_t flags = pte_flags::R | pte_flags::W) {
     logger_.log("allocate_one_vm_page: va=%x, top_pgtbl_pa=%x, flags=%x", va, top_pgtbl_pa, flags);
-    auto pa = page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
+    auto pa = allocate_one_page().value_or(0);
     if (pa == 0) {
       throw std::runtime_error("Failed to allocate physical page for VM");
     }
@@ -237,8 +237,7 @@ private:
   }
 
   auto allocate_page_table_node() -> std::optional<uint32_t> {
-    const uint64_t addr_64 =
-        page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
+    const uint64_t addr_64 = allocate_one_page().value_or(0);
     if (addr_64 != 0) {
       logger_.log("Allocated page table node at physical address: %x", addr_64);
       return static_cast<uint32_t>(addr_64);
@@ -257,12 +256,11 @@ private:
         if (!pte_is_leaf(pte)) {
           free_page_table_inner(pte_pa(pte), level - 1);
         } else {
-          page_allocator_->atomic_release(pte_pa(pte));
+          release_one_page(pte_pa(pte));
         }
       }
     }
-
-    page_allocator_->atomic_release(pa);
+    release_one_page(pa);
   }
 
   void dump_page_table_inner(uint32_t root_pa, sparse_scratchpad_t &dump) {
@@ -276,12 +274,33 @@ private:
     }
   }
 
+  auto allocate_one_page() -> std::optional<addr_t> {
+    const auto pa_opt = page_allocator_->atomic_allocate(PAGE_SIZE);
+    if (!pa_opt.has_value()) {
+      return std::nullopt;
+    }
+    // ignore allocation inside holes, but mark them as released as well
+    if (hole_list_.addr_in_hole(*pa_opt)) {
+      return page_allocator_->atomic_allocate(PAGE_SIZE);
+    } else {
+      return pa_opt;
+    }
+  }
+
+  void release_one_page(addr_t addr) {
+    // don't release addresses within the hole
+    if (!hole_list_.addr_in_hole(addr)) {
+      page_allocator_->atomic_release(addr);
+    }
+  }
+
   // SV32 configuration
 public:
   // SV32 satp: bit[31]=1 (SV32 mode), bits[30:22]=ASID=0, bits[21:0]=PPN
   static auto make_satp_sv32(addr_t pgtbl_pa) -> uint32_t {
     return (1u << 31) | ((pgtbl_pa >> 12) & 0x3FFFFFu);
   }
+  
   static auto from_satp_sv32(satp_t satp) -> addr_t {
     return (satp & 0x3FFFFFu) << 12;
   }
@@ -289,7 +308,7 @@ public:
   static auto make_satp_sv64(addr_t pgtbl_pa) -> uint64_t {
     return (8ull << 60) | ((pgtbl_pa >> 12) & 0xFFFFFFFFFFFu);
   }
-  
+
   static auto from_satp_sv64(satp_t satp) -> addr_t {
     return (satp & 0xFFFFFFFFFFFu) << 12;
   }
@@ -319,5 +338,6 @@ private:
   MemoryAllocatorInterface *page_allocator_;
   ScratchpadMemory *scratchpad_;
   Logger logger_;
+  HoleList hole_list_;
 };
 } // namespace espiral

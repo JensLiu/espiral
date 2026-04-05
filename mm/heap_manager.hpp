@@ -3,7 +3,6 @@
 #include "address_space_manager.hpp"
 #include "allocator/bump_allocator.hpp"
 #include "allocator/memory_allocator_interface.hpp"
-#include "allocator/vortex_memory_allocator.hpp"
 
 #include <cstdio>
 

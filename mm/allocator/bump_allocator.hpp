@@ -47,7 +47,7 @@ public:
   void end_transaction() override {
     mutex_.unlock();
   }
-  auto _allocate_ignorant_of_holes(size_t size) -> std::optional<addr_t> override {
+  auto allocate(size_t size) -> std::optional<addr_t> override {
     if (size == 0) {
       if (verbose_) {
         printf("espiral::BumpAllocator: Error: invalid arguments\n");
@@ -64,7 +64,7 @@ public:
     nextAddress_ += size;
     return std::optional<addr_t>(addr);
   }
-  bool _release_ignorant_of_holes(addr_t /*addr*/) override {
+  bool release(addr_t /*addr*/) override {
     throw std::runtime_error("espiral::BumpAllocator: Error: does not support release");
   }
 

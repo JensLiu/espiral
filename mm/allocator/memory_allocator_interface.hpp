@@ -21,25 +21,8 @@ public:
   // memory management
   // NOTE: currently we just ignore the hole 
   // (assuming the allocator will have side effects when trying to allocate and release addresses within holes)
-  virtual auto allocate(size_t size) -> std::optional<addr_t> {
-    std::cout << "MemoryAllocatorInterface::allocate called with size: " << size << std::endl;
-    auto addr = _allocate_ignorant_of_holes(size);
-    std::cout << "MemoryAllocatorInterface::allocate returned address: " << (addr.has_value() ? std::to_string(*addr) : "nullopt") << std::endl;
-    if (!addr.has_value()) {
-      return std::nullopt;
-    }
-    if (addr_within_hole(*addr)) {
-      return _allocate_ignorant_of_holes(size);
-    } else {
-      return addr;
-    }
-  };
-  virtual auto release(addr_t addr) -> bool {
-    if (!addr_within_hole(addr)) {
-      return _release_ignorant_of_holes(addr);
-    }
-    return true;
-  };
+  virtual auto allocate(size_t size) -> std::optional<addr_t> = 0;
+  virtual auto release(addr_t addr) -> bool = 0;
   // allocator size
   virtual void set_growable(bool growable) = 0;
   virtual void grow_capacity(uint64_t additional_capacity) {
@@ -47,22 +30,6 @@ public:
   };
   virtual auto shrink_capacity(uint64_t reduced_capacity) -> bool {
     throw std::runtime_error("This allocator does not support shrink_capacity");
-  };
-  // hole list
-  virtual void set_hole_list(const std::unordered_map<addr_t, size_t> &holes) {
-    throw std::runtime_error("This allocator does not support hole list");
-  };
-  virtual auto addr_within_hole(addr_t addr) -> bool {
-    const auto hole_list = _get_hole_list();
-    if (!hole_list.has_value()) {
-      return false;  // < no holes
-    }
-    for (const auto &[hole_start, hole_size] : *hole_list) {
-      if (addr >= hole_start && addr < (hole_start + hole_size)) {
-        return true;
-      }
-    }
-    return false;
   };
   // transactional operations
   virtual void begin_transaction() = 0;
@@ -79,24 +46,5 @@ public:
     end_transaction();
     return res;
   }
-
-protected:
-  // internal hooks: not exposed on the public API
-  // TODO: refactor to use strategy?
-  virtual auto _allocate_ignorant_of_holes(size_t size) -> std::optional<addr_t> {
-    throw std::runtime_error("Allocating ignorant of holes is not implemented");
-  };
-  virtual auto _release_ignorant_of_holes(addr_t addr) -> bool {
-    throw std::runtime_error("Releasing ignorant of holes is not implemented");
-  };
-  // virtual auto _allocate_hole_aware(size_t size) -> std::optional<addr_t> {
-  //   throw std::runtime_error("Hole-aware allocating is not implemented");
-  // }
-  // virtual auto _release_hole_aware(addr_t addr) -> bool {
-  //   throw std::runtime_error("Hole-aware releasing is not implemented");
-  // }
-  virtual auto _get_hole_list() const -> std::optional<std::unordered_map<addr_t, size_t>> {
-    return std::nullopt;
-  };
 };
 } // namespace espiral
