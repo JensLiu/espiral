@@ -3,6 +3,7 @@
 #include "../common/common.h"
 
 #include "../includes/espiral_common.h"
+#include "accelerator/host_accelerator_interface.hpp"
 #include "allocator/memory_allocator_interface.hpp"
 #include "scratchpad_memory.hpp"
 
@@ -23,19 +24,26 @@ public:
 class AddressSpaceManager {
 public:
   AddressSpaceManager(MemoryAllocatorInterface *pageAllocator,
-                      ScratchpadMemory *scratchpadMemory)
+                      ScratchpadMemory *scratchpadMemory, HostAcceleratorInterface *accelerator)
       : page_allocator_(pageAllocator), scratchpad_(scratchpadMemory), logger_("espiral::AddressSpaceManager") {
     logger_.set_verbose(true);
-    logger_.println("ctor begin, page_allocator=%p scratchpad=%p", (void *)page_allocator_, (void *)scratchpad_);
+    logger_.log("ctor begin, page_allocator=%p scratchpad=%p", (void *)page_allocator_, (void *)scratchpad_);
     page_allocator_->init_base_address(ALLOC_BASE_ADDR);
-    logger_.println("init_base_address done");
+    logger_.log("init_base_address done");
     page_allocator_->init_capacity(GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR);
-    logger_.println("init_capacity done");
+    logger_.log("init_capacity done");
     page_allocator_->init_page_alignment(MEM_PAGE_SIZE);
-    logger_.println("init_page_alignment done");
+    logger_.log("init_page_alignment done");
     page_allocator_->init_block_alignment(CACHE_BLOCK_SIZE);
-    logger_.println("init_block_alignment done");
+    logger_.log("init_block_alignment done");
     logger_.log("Initialized with base address: %lx, capacity: %lx, page alignment: %d, block alignment: %d", ALLOC_BASE_ADDR, (GLOBAL_MEM_SIZE - ALLOC_BASE_ADDR), MEM_PAGE_SIZE, CACHE_BLOCK_SIZE);
+    page_allocator_->set_growable(false);
+    // reserve these regions so that we can do identity mapping for them later
+    page_allocator_->set_hole_list({
+      {IO_BASE_ADDR, IO_END_ADDR - IO_BASE_ADDR},
+      {LMEM_BASE_ADDR, accelerator->get_caps(VX_CAPS_LOCAL_MEM_SIZE).value_or(0)},
+    });
+    logger_.log("Set hole list for IO and LMEM");
   }
 
   ~AddressSpaceManager() {
@@ -53,12 +61,15 @@ public:
     return std::nullopt;
   }
 
-  void map_addr(uint32_t va, uint32_t pa, addr_t top_pgtbl_pa, uint32_t flags = pte_flags::R | pte_flags::W) {
-    map_addr_inner(va, pa, top_pgtbl_pa, flags);
-    logger_.log("Mapped address: %x to physical address: %x with flags: %x", va, pa, flags);
+  void unsafe_map_identity(addr_t addr, uint32_t size, addr_t top_pgtbl_pa, uint32_t flags = pte_flags::R | pte_flags::W) {
+    logger_.log("unsafe_map_identity: addr=%x, size=%x, top_pgtbl_pa=%x, flags=%x", addr, size, top_pgtbl_pa, flags);
+    for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE) {
+      map_addr_inner(addr + offset, addr + offset, top_pgtbl_pa, flags);
+    }
   }
 
   auto translate_or_else_allocate_page(uint32_t va, addr_t top_pgtbl_pa) -> int32_t {
+    logger_.log("translate_or_else_allocate_page: va=%x, top_pgtbl_pa=%x", va, top_pgtbl_pa);
     const auto pa = translate(va, top_pgtbl_pa);
     if (!pa.has_value()) {
       allocate_one_vm_page(va, top_pgtbl_pa);
@@ -68,6 +79,7 @@ public:
   }
 
   auto translate(uint32_t va, addr_t top_pgtbl_pa) -> std::optional<uint32_t> {
+    logger_.log("translate: va=%x, top_pgtbl_pa=%x", va, top_pgtbl_pa);
     try {
       return page_table_walk(va, top_pgtbl_pa);
     } catch (const PageFaultException &e) {
@@ -76,33 +88,37 @@ public:
   }
 
   void free_page_table(addr_t top_pgtbl_pa) {
+    logger_.log("free_page_table: top_pgtbl_pa=%x", top_pgtbl_pa);
     free_page_table_inner(top_pgtbl_pa, PT_LEVELS - 1);
   }
 
   void allocate_vm_pages(uint32_t va, uint32_t size, addr_t top_pgtbl_pa,
                          uint32_t flags = pte_flags::R | pte_flags::W) {
+    logger_.log("allocate_vm_pages: va=%x, size=%x, top_pgtbl_pa=%x, flags=%x", va, size, top_pgtbl_pa, flags);
     for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE) {
       allocate_one_vm_page(va + offset, top_pgtbl_pa, flags);
     }
   }
 
   void allocate_one_vm_page(uint32_t va, addr_t top_pgtbl_pa, uint32_t flags = pte_flags::R | pte_flags::W) {
-
+    logger_.log("allocate_one_vm_page: va=%x, top_pgtbl_pa=%x, flags=%x", va, top_pgtbl_pa, flags);
     auto pa = page_allocator_->atomic_allocate(PAGE_SIZE).value_or(0);
     if (pa == 0) {
       throw std::runtime_error("Failed to allocate physical page for VM");
     }
     // check if the va is already mapped
-    map_addr(va, pa, top_pgtbl_pa, flags);
+    map_addr_inner(va, pa, top_pgtbl_pa, flags);
   }
 
   auto dump_page_table(addr_t top_pgtbl_pa) -> sparse_scratchpad_t {
+    logger_.log("dump_page_table: top_pgtbl_pa=%x", top_pgtbl_pa);
     sparse_scratchpad_t dump;
     dump_page_table_inner(top_pgtbl_pa, dump);
     return dump;
   }
 
   auto dump_address_mapping(addr_t top_pgtbl_pa) -> std::vector<std::pair<addr_t, addr_t>> {
+    logger_.log("dump_address_mapping: top_pgtbl_pa=%x", top_pgtbl_pa);
     std::vector<std::pair<addr_t, addr_t>> mapping;
     dump_address_mapping_inner(top_pgtbl_pa, PT_LEVELS - 1, 0, mapping);
     return mapping;
@@ -175,6 +191,10 @@ private:
     logger_.log("leaf_pte: %x", leaf_pte);
     if (pte_valid(read_pte(pte_addr))) {
       scratchpad_->end_transaction();
+      // print the existing mapping for debugging
+      uint32_t existing_pte = read_pte(pte_addr);
+      const auto existing_pa = translate(va, top_pgtbl_pa);
+      logger_.println("Error: VA %x is already mapped to PA %x with PTE %x", va, existing_pa.has_value() ? *existing_pa : 0, existing_pte);
       throw std::runtime_error("Virtual address already mapped");
     }
     write_pte(pte_addr, leaf_pte);

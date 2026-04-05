@@ -24,8 +24,19 @@ public:
   }
   void init_page_alignment(uint32_t /*align*/) override {}
   void init_block_alignment(uint32_t /*align*/) override {}
+  void set_growable(bool growable) override {
+    if (!growable_.has_value()) {
+      growable_ = growable;
+    } else if (growable != *growable_) {
+      throw std::runtime_error("BumpAllocator: cannot change growable after initialization");
+    }
+  }
   void grow_capacity(uint64_t additional_capacity) override {
-    capacity_ += additional_capacity;
+    if (growable_.has_value() && *growable_) {
+      capacity_ += additional_capacity;
+      return;
+    }
+    throw std::runtime_error("BumpAllocator: this instance does not support growing capacity");
   }
   bool shrink_capacity(uint64_t /*reduced_capacity*/) override {
     throw std::runtime_error("BumpAllocator does not support shrink_capacity");
@@ -36,7 +47,7 @@ public:
   void end_transaction() override {
     mutex_.unlock();
   }
-  auto allocate(size_t size) -> std::optional<addr_t> override {
+  auto _allocate_ignorant_of_holes(size_t size) -> std::optional<addr_t> override {
     if (size == 0) {
       if (verbose_) {
         printf("espiral::BumpAllocator: Error: invalid arguments\n");
@@ -53,7 +64,7 @@ public:
     nextAddress_ += size;
     return std::optional<addr_t>(addr);
   }
-  bool release(addr_t /*addr*/) override {
+  bool _release_ignorant_of_holes(addr_t /*addr*/) override {
     throw std::runtime_error("espiral::BumpAllocator: Error: does not support release");
   }
 
@@ -62,6 +73,7 @@ private:
   uint64_t capacity_;
   uint64_t nextAddress_;
   std::mutex mutex_;
+  std::optional<bool> growable_ = std::nullopt;
   bool verbose_ = false;
 };
 } // namespace espiral

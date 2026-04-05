@@ -38,7 +38,7 @@ public:
     logger_.log("ctor begin, accelerator=%p", (void *)accelerator_);
     // address space manager
     logger_.log("creating AddressSpaceManager");
-    aspace_ = new AddressSpaceManager(new VortexMemoryAllocator(), new ScratchpadMemory());
+    aspace_ = new AddressSpaceManager(new VortexMemoryAllocator(), new ScratchpadMemory(), accelerator_);
     logger_.log("AddressSpaceManager created=%p", (void *)aspace_);
   }
 
@@ -50,8 +50,13 @@ public:
   void start_kernel(kernel_id_t kid) {
     logger_.log("start_kernel begin, kid=%u, top_pgtbl_pa=%x", kid, kcbs_.at(kid).value().top_pgtbl_pa);
     // mapping
+    logger_.log("Allocating vxbin");
     allocate_vxbin_segments_(kid);
+    logger_.log("Allocating local memory");
+    allocate_local_memory_(kid);
+    logger_.log("Allocating User Stack");
     allocate_user_stack_(kid);
+    logger_.log("Allocating IO Pages");
     allocate_io_pages_(kid);
     // upload
     upload_vxbin_(kid);
@@ -60,7 +65,7 @@ public:
     const auto kcb = kcbs_.at(kid).value();
     const auto mapping = aspace_->dump_address_mapping(kcb.top_pgtbl_pa);
     for (const auto &[va, pa] : mapping) {
-      logger_.log("Mapping: 0x%x -> 0x%x", va, pa);
+      logger_.println("Mapping: 0x%x -> 0x%x", va, pa);
     }
 
     start_kernel_(kid);
@@ -116,6 +121,7 @@ public:
   auto allocate_heap(kernel_id_t kid, size_t size,
                      uint32_t flags = pte_flags::R | pte_flags::W) -> addr_t {
     (void)flags; // HeapManager always maps R|W; reserved for future fine-grained control
+    logger_.log("allocaet heap: kid=%d, size=%d", kid, size);
     const auto kcb = kcbs_.at(kid).value();
     return kcb.heap->allocate(size).value();
   }
@@ -139,7 +145,7 @@ private:
     const auto kcb = kcbs_.at(kid).value();
     const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
     const auto io_size = IO_END_ADDR - IO_BASE_ADDR;
-    aspace_->allocate_vm_pages(
+    aspace_->unsafe_map_identity(
       IO_BASE_ADDR,
       io_size,
       top_pgtbl_pa,
@@ -198,6 +204,21 @@ private:
     }
   }
 
+  void allocate_local_memory_(kernel_id_t kid) {
+    const auto kcb = kcbs_.at(kid).value();
+    const auto top_pgtbl_pa = kcb.top_pgtbl_pa;
+    const auto lmem_size = accelerator_->get_caps(VX_CAPS_LOCAL_MEM_SIZE).value_or(0);
+    if (lmem_size == 0) {
+      logger_.log("No local memory reported by accelerator, skipping LMEM allocation");
+      return;
+    }
+    aspace_->unsafe_map_identity(
+      LMEM_BASE_ADDR,
+      lmem_size,
+      top_pgtbl_pa,
+      pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
+  }
+
   void allocate_user_stack_(kernel_id_t kid) {
     const auto kcb = kcbs_.at(kid).value();
     const uint64_t per_stack_size = (1ull << STACK_LOG2_SIZE);
@@ -207,8 +228,8 @@ private:
     // look into `VX_csr_uint.sv` for mheartid encoding details
     const uint32_t num_threads = accelerator_->get_caps(VX_CAPS_NUM_THREADS).value_or( NUM_THREADS);
     const uint32_t num_warps = accelerator_->get_caps(VX_CAPS_NUM_WARPS).value_or(NUM_WARPS);
-    const uint32_t num_cores = accelerator_->get_caps(VX_CAPS_NUM_CORES).value_or(NUM_CORES * NUM_CLUSTERS);
-    // const uint32_t num_cores = 4;
+    // const uint32_t num_cores = accelerator_->get_caps(VX_CAPS_NUM_CORES).value_or(NUM_CORES * NUM_CLUSTERS);
+    const uint32_t num_cores = 4;
 
     const uint32_t nt_bits = std::ceil(std::log2(num_threads));
     const uint32_t nw_bits = std::ceil(std::log2(num_warps));
@@ -217,18 +238,20 @@ private:
                               + (num_threads - 1);
     const uint64_t n_stack_slots = max_hartid + 1;
     const uint64_t stack_size_64 = per_stack_size * n_stack_slots;
-    const uint64_t stack_top_va_64 = STACK_BASE_ADDR;
 
+    const uint64_t local_mem_size = accelerator_->get_caps(VX_CAPS_LOCAL_MEM_SIZE).value_or(0);
+    std::cout << "num_threads: " << num_threads << ", num_warps: " << num_warps << ", num_cores: " << num_cores << std::endl;
+    std::cout << "Calculated stack size: " << stack_size_64 << " bytes: " << n_stack_slots << " slots with " << per_stack_size << " bytes each" << std::endl;
+    const uint64_t user_stack_end_va = STACK_BASE_ADDR; // stack grows down from the top of the local memory region
+    const uint64_t user_stack_start_va = user_stack_end_va - stack_size_64;
     const uint32_t stack_size = static_cast<uint32_t>(stack_size_64);
-    const uint32_t stack_top_va = static_cast<uint32_t>(stack_top_va_64);
-    const uint32_t stack_base_va = stack_top_va - stack_size;
     aspace_->allocate_vm_pages(
-      stack_base_va,
+      user_stack_start_va,
       stack_size,
       kcb.top_pgtbl_pa,
       pte_flags::R | pte_flags::W | pte_flags::U | pte_flags::A | pte_flags::D);
     logger_.log("Allocated user stack for kernel id: %u, stack_base_va: %x, stack_top_va: %x, stack_size: %u bytes, slots: %u, cores=%u, warps=%u, threads=%u",
-                kid, stack_base_va, stack_top_va, stack_size, (uint32_t)n_stack_slots, num_cores, num_warps, num_threads);
+                kid, user_stack_start_va, user_stack_start_va + stack_size, stack_size, (uint32_t)n_stack_slots, num_cores, num_warps, num_threads);
   }
 
   void upload_page_table_(kernel_id_t kid) {

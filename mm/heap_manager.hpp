@@ -12,8 +12,9 @@ class HeapManager {
 
 public:
   HeapManager(AddressSpaceManager *aspace, addr_t top_pgtbl_pa, addr_t base_va) : aspace_(aspace), top_pgtbl_pa_(top_pgtbl_pa), logger_("espiral::HeapManager") {
-    logger_.set_verbose(true);
+    // logger_.set_verbose(true);
     vm_allocator_ = new BumpAllocator();
+    vm_allocator_->set_growable(true);
     vm_allocator_->init_base_address(base_va);
     vm_allocator_->init_capacity(0);
   }
